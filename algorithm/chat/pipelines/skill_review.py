@@ -232,9 +232,13 @@ def _normalize_session(raw: Any, index: int) -> SessionData:
 def _normalize_message(raw: dict[str, Any]) -> SessionMessage:
     tool_name = raw.get('tool_name') or raw.get('name')
     skill_name = raw.get('skill_name') or raw.get('skill')
+    role = str(raw.get('role') or raw.get('type') or 'unknown')
+    content = raw.get('content')
+    if content is None and str(role).strip().lower() in {'tool', 'function', 'tool_call'}:
+        content = raw.get('result')
     return SessionMessage(
-        role=str(raw.get('role') or raw.get('type') or 'unknown'),
-        content=str(raw.get('content') or raw.get('result') or ''),
+        role=role,
+        content=str(content or ''),
         created_at=_optional_str(raw.get('created_at') or raw.get('timestamp')),
         tool_name=_optional_str(tool_name),
         skill_name=_optional_str(skill_name),

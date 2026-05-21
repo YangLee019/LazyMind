@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 from chat.components.skill_review.schemas import SessionData, SessionMessage, Trajectory, TrajectoryStep
 
@@ -18,6 +18,7 @@ def build_trajectory(
     steps: list[TrajectoryStep] = []
     called_tools: list[str] = []
     called_skills: list[str] = []
+    tool_call_skill_by_id: dict[str, str] = {}
     final_answer: str | None = None
 
     for index, message in enumerate(session.messages, start=1):
@@ -41,6 +42,8 @@ def build_trajectory(
         if role == 'tool':
             tool_name = message.tool_name or _extract_tool_name(message)
             skill_name = message.skill_name or _extract_skill_name(message)
+            if not skill_name:
+                skill_name = _infer_skill_name_from_tool_result(tool_name, message, tool_call_skill_by_id)
             if tool_name:
                 called_tools.append(tool_name)
             if skill_name:
@@ -56,17 +59,19 @@ def build_trajectory(
                     tool_name=tool_name,
                     skill_name=skill_name,
                     message_index=index,
-                    tool_output=message.raw.get('result') if isinstance(message.raw, dict) else message.content,
+                    tool_output=_extract_tool_output(message),
                     raw=message.raw,
                 )
             )
             continue
 
         assistant_reasoning = _shorten(_extract_reasoning(message), 4000)
-        assistant_text = _shorten(message.content, 4000)
+        assistant_text = _shorten(_extract_assistant_text(message), 4000)
         tool_calls = _extract_tool_calls(message)
         tool_name = message.tool_name or _extract_tool_name(message)
         skill_name = message.skill_name or _extract_skill_name(message)
+        if not skill_name:
+            skill_name = _infer_skill_name_from_tool_calls(tool_calls)
         if tool_name:
             called_tools.append(tool_name)
         if skill_name:
@@ -92,8 +97,11 @@ def build_trajectory(
 
         for sub_index, tool_call in enumerate(tool_calls, start=1):
             call_name = str(tool_call.get('name') or '').strip() or None
+            call_id = str(tool_call.get('id') or '').strip() or None
             if call_name:
                 called_tools.append(call_name)
+            if call_id and skill_name:
+                tool_call_skill_by_id[call_id] = skill_name
             steps.append(
                 TrajectoryStep(
                     step_index=len(steps) + 1,
@@ -110,8 +118,8 @@ def build_trajectory(
                 )
             )
 
-        if _is_final_answer_candidate(message, tool_calls):
-            final_answer = _shorten(message.content, _FINAL_ANSWER_LIMIT) or final_answer
+        if _is_final_answer_candidate(session.messages, index, message, tool_calls):
+            final_answer = _shorten(_extract_assistant_text(message), _FINAL_ANSWER_LIMIT) or final_answer
             for step in reversed(steps):
                 if step.message_index == index and step.role == 'assistant':
                     step.is_final = True
@@ -120,7 +128,7 @@ def build_trajectory(
     user_turns = sum(1 for step in steps if step.role == 'user')
     tool_turns = sum(
         1 for step in steps
-        if step.kind in {'tool_call', 'tool_result'} or step.role in _TOOL_ROLE_NAMES or step.tool_name
+        if step.kind in {'tool_call', 'tool_result'} or step.role in _TOOL_ROLE_NAMES
     )
     qualified = user_turns >= min_user_turns and tool_turns >= min_tool_turns
     skip_reason = None
@@ -156,18 +164,25 @@ def _normalize_role(role: str) -> str:
 
 
 def _extract_tool_name(message: SessionMessage) -> str | None:
-    raw_text = str(message.raw or {})
-    match = re.search(r'"(?:tool_name|tool|function_name|name)"\s*:\s*"([^"]+)"', raw_text)
-    if match:
-        return match.group(1)
+    raw = message.raw if isinstance(message.raw, dict) else {}
+    name = raw.get('tool_name') or raw.get('name')
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+
+    tool_calls = _extract_tool_calls(message)
+    if tool_calls:
+        call_name = tool_calls[0].get('name')
+        if isinstance(call_name, str) and call_name.strip():
+            return call_name.strip()
     return None
 
 
 def _extract_skill_name(message: SessionMessage) -> str | None:
-    raw_text = str(message.raw or {})
-    match = re.search(r'"(?:skill_name|skill|called_skill)"\s*:\s*"([^"]+)"', raw_text)
-    if match:
-        return match.group(1)
+    raw = message.raw if isinstance(message.raw, dict) else {}
+    for key in ('skill_name', 'skill', 'called_skill'):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return None
 
 
@@ -177,6 +192,60 @@ def _extract_reasoning(message: SessionMessage) -> str:
     if reasoning:
         return str(reasoning)
     return ''
+
+
+def _extract_assistant_text(message: SessionMessage) -> str:
+    raw = message.raw if isinstance(message.raw, dict) else {}
+    content = raw.get('content')
+    if content is None:
+        return str(message.content or '')
+    return str(content)
+
+
+def _extract_tool_output(message: SessionMessage) -> Any:
+    raw = message.raw if isinstance(message.raw, dict) else {}
+    if 'result' in raw and raw.get('result') is not None:
+        return raw.get('result')
+    if 'content' in raw and raw.get('content') is not None:
+        return _safe_json_loads(raw.get('content'))
+    return _safe_json_loads(message.content)
+
+
+def _infer_skill_name_from_tool_calls(tool_calls: list[dict[str, Any]]) -> str | None:
+    for tool_call in tool_calls:
+        call_name = str(tool_call.get('name') or '').strip()
+        arguments = tool_call.get('arguments')
+        if not isinstance(arguments, dict):
+            continue
+        if call_name in {'skill_manage', 'get_skill', 'run_script'}:
+            name = arguments.get('name')
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return None
+
+
+def _infer_skill_name_from_tool_result(
+    tool_name: str | None,
+    message: SessionMessage,
+    tool_call_skill_by_id: dict[str, str],
+) -> str | None:
+    raw = message.raw if isinstance(message.raw, dict) else {}
+    tool_call_id = raw.get('tool_call_id')
+    if isinstance(tool_call_id, str):
+        mapped = tool_call_skill_by_id.get(tool_call_id)
+        if mapped:
+            return mapped
+    if tool_name in {'skill_manage', 'get_skill', 'run_script'}:
+        content = raw.get('content')
+        if isinstance(content, str) and content.strip():
+            parsed = _safe_json_loads(content)
+            if isinstance(parsed, dict):
+                result = parsed.get('result')
+                if isinstance(result, dict):
+                    name = result.get('name')
+                    if isinstance(name, str) and name.strip():
+                        return name.strip()
+    return None
 
 
 def _extract_tool_calls(message: SessionMessage) -> list[dict[str, Any]]:
@@ -211,7 +280,12 @@ def _safe_json_loads(value: Any) -> Any:
         return value
 
 
-def _is_final_answer_candidate(message: SessionMessage, tool_calls: list[dict[str, Any]]) -> bool:
+def _is_final_answer_candidate(
+    messages: list[SessionMessage],
+    index: int,
+    message: SessionMessage,
+    tool_calls: list[dict[str, Any]],
+) -> bool:
     raw = message.raw if isinstance(message.raw, dict) else {}
     if raw.get('tool_calls'):
         return False
@@ -219,6 +293,8 @@ def _is_final_answer_candidate(message: SessionMessage, tool_calls: list[dict[st
     if not text:
         return False
     if message.role not in {'assistant', 'ai', 'agent', 'bot'}:
+        return False
+    if index != len(messages):
         return False
     return True
 
