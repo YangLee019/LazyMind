@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Iterable
 
 from chat.components.skill_review.schemas import SessionData, SessionMessage, Trajectory, TrajectoryStep
 
 _TOOL_ROLE_NAMES = {'tool', 'function', 'tool_call'}
-_FINAL_ANSWER_LIMIT = 4000
 
 
 def build_trajectory(
@@ -19,7 +17,6 @@ def build_trajectory(
     called_tools: list[str] = []
     called_skills: list[str] = []
     tool_call_skill_by_id: dict[str, str] = {}
-    final_answer: str | None = None
 
     for index, message in enumerate(session.messages, start=1):
         role = _normalize_role(message.role)
@@ -118,12 +115,8 @@ def build_trajectory(
                 )
             )
 
-        if _is_final_answer_candidate(session.messages, index, message, tool_calls):
-            final_answer = _shorten(_extract_assistant_text(message), _FINAL_ANSWER_LIMIT) or final_answer
-            for step in reversed(steps):
-                if step.message_index == index and step.role == 'assistant':
-                    step.is_final = True
-                    break
+    _assign_task_segments(steps)
+    _mark_task_ends(steps)
 
     user_turns = sum(1 for step in steps if step.role == 'user')
     tool_turns = sum(
@@ -146,7 +139,6 @@ def build_trajectory(
         called_tools=_unique(called_tools),
         called_skills=_unique(called_skills),
         steps=steps,
-        final_answer=final_answer,
         qualified=qualified,
         skip_reason=skip_reason,
     )
@@ -280,25 +272,6 @@ def _safe_json_loads(value: Any) -> Any:
         return value
 
 
-def _is_final_answer_candidate(
-    messages: list[SessionMessage],
-    index: int,
-    message: SessionMessage,
-    tool_calls: list[dict[str, Any]],
-) -> bool:
-    raw = message.raw if isinstance(message.raw, dict) else {}
-    if raw.get('tool_calls'):
-        return False
-    text = str(message.content or '').strip()
-    if not text:
-        return False
-    if message.role not in {'assistant', 'ai', 'agent', 'bot'}:
-        return False
-    if index != len(messages):
-        return False
-    return True
-
-
 def _unique(values: Iterable[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -316,3 +289,35 @@ def _shorten(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + '...'
+
+
+def _assign_task_segments(steps: list[TrajectoryStep]) -> None:
+    segment_id = 0
+    for step in steps:
+        if step.kind == 'user_message' and step.role == 'user':
+            segment_id += 1
+        elif segment_id == 0:
+            segment_id = 1
+        step.task_segment_id = segment_id
+
+
+def _mark_task_ends(steps: list[TrajectoryStep]) -> None:
+    last_assistant_step_by_segment: dict[int, TrajectoryStep] = {}
+    for step in steps:
+        if not _is_task_end_candidate(step):
+            continue
+        last_assistant_step_by_segment[step.task_segment_id] = step
+
+    for step in last_assistant_step_by_segment.values():
+        step.is_task_end = True
+
+
+def _is_task_end_candidate(step: TrajectoryStep) -> bool:
+    if step.kind == 'assistant_message' and step.role == 'assistant':
+        raw = step.raw if isinstance(step.raw, dict) else {}
+        if raw.get('tool_calls'):
+            return False
+        return bool(str(step.result or '').strip())
+    if step.kind == 'tool_result' and step.role == 'tool':
+        return bool(str(step.action or '').strip())
+    return False

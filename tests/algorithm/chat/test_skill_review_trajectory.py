@@ -14,7 +14,7 @@ def _build_session(messages: list[SessionMessage], session_id: str = 'session-1'
     )
 
 
-def test_build_trajectory_extracts_user_assistant_tool_and_final_answer():
+def test_build_trajectory_extracts_user_assistant_tool_and_task_end():
     session = _build_session(
         [
             SessionMessage(
@@ -71,7 +71,6 @@ def test_build_trajectory_extracts_user_assistant_tool_and_final_answer():
     assert trajectory.user_turns == 1
     assert trajectory.tool_turns == 2
     assert trajectory.called_tools == ['weather']
-    assert trajectory.final_answer == '今天上海天气晴朗，气温适中，空气质量良，适合跑步。'
 
     assert [step.kind for step in trajectory.steps] == [
         'user_message',
@@ -104,7 +103,8 @@ def test_build_trajectory_extracts_user_assistant_tool_and_final_answer():
     }
 
     final_step = trajectory.steps[4]
-    assert final_step.is_final is True
+    assert [step.task_segment_id for step in trajectory.steps] == [1, 1, 1, 1, 1]
+    assert final_step.is_task_end is True
     assert final_step.result == '今天上海天气晴朗，气温适中，空气质量良，适合跑步。'
 
 
@@ -136,7 +136,7 @@ def test_build_trajectory_marks_unqualified_when_tool_turns_not_enough():
     assert trajectory.tool_turns == 0
     assert trajectory.qualified is False
     assert trajectory.skip_reason is not None
-    assert trajectory.final_answer == '当然，请把原句发给我。'
+    assert trajectory.steps[1].is_task_end is True
 
 
 def test_build_trajectory_uses_only_content_for_assistant_messages():
@@ -191,10 +191,10 @@ def test_build_trajectory_uses_only_content_for_assistant_messages():
     assistant_step = trajectory.steps[1]
     assert assistant_step.result == '我先帮你保存。'
     assert 'should_not' not in assistant_step.result
-    assert trajectory.final_answer == '已经保存好了。'
+    assert trajectory.steps[4].is_task_end is True
 
 
-def test_build_trajectory_marks_only_last_assistant_reply_as_final():
+def test_build_trajectory_marks_task_end_per_user_segment():
     session = _build_session(
         [
             SessionMessage(
@@ -243,7 +243,7 @@ def test_build_trajectory_marks_only_last_assistant_reply_as_final():
                 raw={'role': 'assistant', 'content': '记得带水，今天适合外出。'},
             ),
         ],
-        session_id='session-final-answer-last-only',
+        session_id='session-task-end-per-segment',
     )
 
     trajectory = build_trajectory(
@@ -253,8 +253,63 @@ def test_build_trajectory_marks_only_last_assistant_reply_as_final():
     )
 
     assistant_steps = [step for step in trajectory.steps if step.role == 'assistant' and step.kind == 'assistant_message']
-    assert [step.is_final for step in assistant_steps] == [False, False, True]
-    assert trajectory.final_answer == '记得带水，今天适合外出。'
+    assert [step.task_segment_id for step in trajectory.steps] == [1, 1, 1, 1, 1, 2, 2]
+    assert [step.is_task_end for step in assistant_steps] == [False, True, True]
+
+
+def test_build_trajectory_marks_tool_result_as_task_end_without_followup_assistant():
+    session = _build_session(
+        [
+            SessionMessage(
+                role='user',
+                content='帮我查一下网络状态。',
+                raw={'role': 'user', 'content': '帮我查一下网络状态。'},
+            ),
+            SessionMessage(
+                role='assistant',
+                content='我来检查。',
+                raw={
+                    'role': 'assistant',
+                    'content': '我来检查。',
+                    'tool_calls': [
+                        {
+                            'id': 'call_web_1',
+                            'name': 'web_search',
+                            'arguments': {'query': 'network status'},
+                        }
+                    ],
+                },
+            ),
+            SessionMessage(
+                role='tool',
+                content='{"success":false,"status":"timeout"}',
+                tool_name='web_search',
+                raw={
+                    'role': 'tool',
+                    'name': 'web_search',
+                    'content': '{"success":false,"status":"timeout"}',
+                    'tool_call_id': 'call_web_1',
+                },
+            ),
+            SessionMessage(
+                role='user',
+                content='那先算了。',
+                raw={'role': 'user', 'content': '那先算了。'},
+            ),
+        ],
+        session_id='session-no-task-end',
+    )
+
+    trajectory = build_trajectory(
+        session,
+        min_user_turns=1,
+        min_tool_turns=1,
+    )
+
+    assert [step.task_segment_id for step in trajectory.steps] == [1, 1, 1, 1, 2]
+    assert trajectory.steps[3].kind == 'tool_result'
+    assert trajectory.steps[3].is_task_end is True
+    assert not any(step.is_task_end for step in trajectory.steps[:3])
 
 
 def test_build_trajectory_extracts_tool_output_from_tool_content_json():

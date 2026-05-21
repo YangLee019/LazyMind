@@ -57,7 +57,8 @@ class TrajectoryStep(BaseModel):
     result: Optional[str] = None
     tool_input: Optional[Any] = None
     tool_output: Optional[Any] = None
-    is_final: bool = False
+    task_segment_id: int = 0
+    is_task_end: bool = False
     raw: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -68,7 +69,6 @@ class Trajectory(BaseModel):
     called_tools: List[str] = Field(default_factory=list)
     called_skills: List[str] = Field(default_factory=list)
     steps: List[TrajectoryStep] = Field(default_factory=list)
-    final_answer: Optional[str] = None
     qualified: bool = False
     skip_reason: Optional[str] = None
 
