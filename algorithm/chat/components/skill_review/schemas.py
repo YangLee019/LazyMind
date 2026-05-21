@@ -47,8 +47,18 @@ class TrajectoryStep(BaseModel):
     role: str
     action: str
     state: str = ''
+    kind: str = 'message'
     tool_name: Optional[str] = None
     skill_name: Optional[str] = None
+    message_index: Optional[int] = None
+    sub_index: int = 0
+    user_message: Optional[str] = None
+    reasoning: Optional[str] = None
+    result: Optional[str] = None
+    tool_input: Optional[Any] = None
+    tool_output: Optional[Any] = None
+    is_final: bool = False
+    raw: Dict[str, Any] = Field(default_factory=dict)
 
 
 class Trajectory(BaseModel):
@@ -58,6 +68,7 @@ class Trajectory(BaseModel):
     called_tools: List[str] = Field(default_factory=list)
     called_skills: List[str] = Field(default_factory=list)
     steps: List[TrajectoryStep] = Field(default_factory=list)
+    final_answer: Optional[str] = None
     qualified: bool = False
     skip_reason: Optional[str] = None
 
