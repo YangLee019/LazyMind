@@ -384,7 +384,7 @@ def test_build_trajectory_extracts_tool_output_from_tool_content_json():
     assert tool_result_step.tool_output == {
         'success': False,
         'status': 'network_unreachable',
-        'error': 'timeout',
+        'error': 'request timeout',
     }
 
 
@@ -625,27 +625,354 @@ def test_build_trajectory_compresses_tool_fields_for_llm_readability():
     tool_result_step = trajectory.steps[3]
 
     assert assistant_step.reasoning == '先确认状态，再看返回的结果列表里有没有可用条目。'
-    assert tool_call_step.action.startswith('Call web_search with')
+    assert tool_call_step.action == 'Call web_search to search for very long query'
     assert tool_call_step.tool_input == {
         'metadata': {'extra': 'x', 'session': 's1', 'trace_id': 'abc'},
         'page': 1,
         'query': 'very long query',
-        'tags': {'count': 5, 'sample': ['alpha', 'beta', 'gamma', 'delta']},
+        'tags': {'count': 5, 'sample': ['alpha', 'beta', 'gamma']},
     }
-    assert tool_result_step.action.startswith('web_search returned')
+    assert tool_result_step.action == 'web_search returned 5 items'
     assert tool_result_step.tool_output == {
         'message': 'found results',
+        'status': 'ok',
         'results': {
             'count': 5,
             'sample': [
-                {'snippet': 'A' * 200, 'title': 'Result A', 'url': '[url]'},
-                {'snippet': 'B' * 200, 'title': 'Result B', 'url': '[url]'},
-                {'snippet': 'C' * 200, 'title': 'Result C', 'url': '[url]'},
-                {'snippet': 'D' * 200, 'title': 'Result D', 'url': '[url]'},
+                {'title': 'Result A', 'url': '[url]', 'snippet': 'A' * 177 + '...'},
+                {'title': 'Result B', 'url': '[url]', 'snippet': 'B' * 177 + '...'},
+                {'title': 'Result C', 'url': '[url]', 'snippet': 'C' * 177 + '...'},
             ],
         },
+        'debug': {'extra': 'unused', 'raw_html': '...', 'timing_ms': 132},
+    }
+
+
+def test_build_trajectory_semantically_compresses_structured_assistant_reply():
+    session = _build_session(
+        [
+            SessionMessage(
+                role='user',
+                content='总结一下EVO研究。',
+                raw={'role': 'user', 'content': '总结一下EVO研究。'},
+            ),
+            SessionMessage(
+                role='assistant',
+                content=(
+                    '根据知识库搜索结果，我为你整理如下：\n\n'
+                    '## 主要方向\n'
+                    '- CoEvoSkills：协同进化框架\n'
+                    '- Evo Skills：自动化技能发现\n'
+                    '- 实验结果：完整框架效果更好\n\n'
+                    '### 结论\n'
+                    'EVO在这里主要指AI技能进化相关研究。'
+                ),
+                raw={
+                    'role': 'assistant',
+                    'content': (
+                        '根据知识库搜索结果，我为你整理如下：\n\n'
+                        '## 主要方向\n'
+                        '- CoEvoSkills：协同进化框架\n'
+                        '- Evo Skills：自动化技能发现\n'
+                        '- 实验结果：完整框架效果更好\n\n'
+                        '### 结论\n'
+                        'EVO在这里主要指AI技能进化相关研究。'
+                    ),
+                    'reasoning_content': '我已经拿到知识库结果，需要先给结论，再补充重点。',
+                },
+            ),
+        ],
+        session_id='session-structured-assistant-summary',
+    )
+
+    trajectory = build_trajectory(
+        session,
+        min_user_turns=1,
+        min_tool_turns=0,
+    )
+
+    assistant_step = trajectory.steps[1]
+    assert assistant_step.action == 'EVO在这里主要指AI技能进化相关研究。'
+    assert assistant_step.result == 'EVO在这里主要指AI技能进化相关研究。'
+    assert assistant_step.reasoning == '我已经拿到知识库结果，需要先给结论，再补充重点。'
+    assert '##' not in assistant_step.result
+    assert '- CoEvoSkills' not in assistant_step.result
+
+
+def test_build_trajectory_semantically_compresses_english_structured_reply():
+    session = _build_session(
+        [
+            SessionMessage(
+                role='user',
+                content='Summarize the EVO research.',
+                raw={'role': 'user', 'content': 'Summarize the EVO research.'},
+            ),
+            SessionMessage(
+                role='assistant',
+                content=(
+                    'Based on the search results, here is a structured summary:\n\n'
+                    '## Main directions\n'
+                    '- CoEvoSkills: a collaborative evolution framework\n'
+                    '- Evo Skills: automated skill discovery\n'
+                    '- Experimental results: the full framework performs better\n\n'
+                    '### Conclusion\n'
+                    'EVO here mainly refers to AI skill evolution research.'
+                ),
+                raw={
+                    'role': 'assistant',
+                    'content': (
+                        'Based on the search results, here is a structured summary:\n\n'
+                        '## Main directions\n'
+                        '- CoEvoSkills: a collaborative evolution framework\n'
+                        '- Evo Skills: automated skill discovery\n'
+                        '- Experimental results: the full framework performs better\n\n'
+                        '### Conclusion\n'
+                        'EVO here mainly refers to AI skill evolution research.'
+                    ),
+                    'reasoning_content': 'I have enough evidence and should provide the conclusion first.',
+                },
+            ),
+        ],
+        session_id='session-structured-assistant-summary-en',
+    )
+
+    trajectory = build_trajectory(
+        session,
+        min_user_turns=1,
+        min_tool_turns=0,
+    )
+
+    assistant_step = trajectory.steps[1]
+    assert assistant_step.action == 'EVO here mainly refers to AI skill evolution research.'
+    assert assistant_step.result == 'EVO here mainly refers to AI skill evolution research.'
+    assert assistant_step.reasoning == 'I have enough evidence and should provide the conclusion first.'
+    assert '##' not in assistant_step.result
+    assert '- CoEvoSkills' not in assistant_step.result
+
+
+def test_build_trajectory_drops_english_tail_phrase_when_extracting_summary():
+    session = _build_session(
+        [
+            SessionMessage(
+                role='user',
+                content='Tell me what tools you have.',
+                raw={'role': 'user', 'content': 'Tell me what tools you have.'},
+            ),
+            SessionMessage(
+                role='assistant',
+                content=(
+                    'I currently have search, memory, and skill management tools available. '
+                    'These let me retrieve information, save preferences, and manage reusable skills. '
+                    'Let me know if you want more details.'
+                ),
+                raw={
+                    'role': 'assistant',
+                    'content': (
+                        'I currently have search, memory, and skill management tools available. '
+                        'These let me retrieve information, save preferences, and manage reusable skills. '
+                        'Let me know if you want more details.'
+                    ),
+                },
+            ),
+        ],
+        session_id='session-english-tail-phrase',
+    )
+
+    trajectory = build_trajectory(
+        session,
+        min_user_turns=1,
+        min_tool_turns=0,
+    )
+
+    assistant_step = trajectory.steps[1]
+    assert 'Let me know if you want more details.' not in assistant_step.result
+    assert 'search, memory, and skill management tools' in assistant_step.result
+
+
+def test_build_trajectory_filters_generic_corrupted_text():
+    session = _build_session(
+        [
+            SessionMessage(
+                role='user',
+                content='看一下这个抓取结果。',
+                raw={'role': 'user', 'content': '看一下这个抓取结果。'},
+            ),
+            SessionMessage(
+                role='assistant',
+                content='我来检查这个结果。',
+                raw={'role': 'assistant', 'content': '我来检查这个结果。'},
+            ),
+            SessionMessage(
+                role='tool',
+                content='',
+                tool_name='url_fetch',
+                raw={
+                    'role': 'tool',
+                    'name': 'url_fetch',
+                    'result': {
+                        'status': 'ok',
+                        'content': '� � \\xE4\\xB8\\xAD Ã¤Â¸Â­ ð\x9f\x8e\x89 Ã¥Â¥Â½ Ã¤Â½Â\xa0',
+                    },
+                },
+            ),
+        ],
+        session_id='session-corrupted-text',
+    )
+
+    trajectory = build_trajectory(
+        session,
+        min_user_turns=1,
+        min_tool_turns=1,
+    )
+
+    tool_result_step = trajectory.steps[2]
+    assert tool_result_step.tool_output == {
         'status': 'ok',
-        'debug': {'extra': 'unused', 'raw_html': '<html>...</html>', 'timing_ms': 132},
+        'content': '[encoding issue omitted]',
+    }
+
+
+def test_build_trajectory_keeps_normal_accented_text():
+    session = _build_session(
+        [
+            SessionMessage(
+                role='user',
+                content='Check the page summary.',
+                raw={'role': 'user', 'content': 'Check the page summary.'},
+            ),
+            SessionMessage(
+                role='assistant',
+                content='I will review the fetched page.',
+                raw={'role': 'assistant', 'content': 'I will review the fetched page.'},
+            ),
+            SessionMessage(
+                role='tool',
+                content='',
+                tool_name='url_fetch',
+                raw={
+                    'role': 'tool',
+                    'name': 'url_fetch',
+                    'result': {
+                        'status': 'ok',
+                        'content': "Résumé de l'étude sur l'évolution de l'IA à Montréal.",
+                    },
+                },
+            ),
+        ],
+        session_id='session-accented-text',
+    )
+
+    trajectory = build_trajectory(
+        session,
+        min_user_turns=1,
+        min_tool_turns=1,
+    )
+
+    tool_result_step = trajectory.steps[2]
+    assert tool_result_step.tool_output == {
+        'status': 'ok',
+        'content': "Résumé de l'étude sur l'évolution de l'IA à Montréal.",
+    }
+
+
+def test_build_trajectory_filters_short_mojibake_title():
+    session = _build_session(
+        [
+            SessionMessage(
+                role='user',
+                content='Check the fetched title.',
+                raw={'role': 'user', 'content': 'Check the fetched title.'},
+            ),
+            SessionMessage(
+                role='assistant',
+                content='I will inspect the fetched page.',
+                raw={'role': 'assistant', 'content': 'I will inspect the fetched page.'},
+            ),
+            SessionMessage(
+                role='tool',
+                content='',
+                tool_name='url_fetch',
+                raw={
+                    'role': 'tool',
+                    'name': 'url_fetch',
+                    'result': {
+                        'status': 'ok',
+                        'title': 'DeepSeek æ·±åº¦æ±ç´¢',
+                    },
+                },
+            ),
+        ],
+        session_id='session-short-mojibake-title',
+    )
+
+    trajectory = build_trajectory(
+        session,
+        min_user_turns=1,
+        min_tool_turns=1,
+    )
+
+    tool_result_step = trajectory.steps[2]
+    assert tool_result_step.tool_output == {
+        'status': 'ok',
+        'title': '[encoding issue omitted]',
+    }
+
+
+def test_build_trajectory_normalizes_embedding_key_error_as_configuration_issue():
+    session = _build_session(
+        [
+            SessionMessage(
+                role='user',
+                content='查一下知识库。',
+                raw={'role': 'user', 'content': '查一下知识库。'},
+            ),
+            SessionMessage(
+                role='assistant',
+                content='我来检索。',
+                raw={
+                    'role': 'assistant',
+                    'content': '我来检索。',
+                    'tool_calls': [
+                        {
+                            'id': 'call_kb_1',
+                            'name': 'kb_search',
+                            'arguments': {'query': 'evo'},
+                        }
+                    ],
+                },
+            ),
+            SessionMessage(
+                role='tool',
+                content='',
+                tool_name='kb_search',
+                raw={
+                    'role': 'tool',
+                    'name': 'kb_search',
+                    'result': {
+                        'success': False,
+                        'reason': 'kb_search failed: Embedding key embed_image not found in group image from document http://x, available keys: []',
+                        'error': 'Embedding key embed_image not found in group image from document http://x, available keys: []',
+                        'error_type': 'RuntimeError',
+                    },
+                },
+            ),
+        ],
+        session_id='session-embedding-key-error',
+    )
+
+    trajectory = build_trajectory(
+        session,
+        min_user_turns=1,
+        min_tool_turns=1,
+    )
+
+    tool_result_step = trajectory.steps[3]
+    assert tool_result_step.action == 'kb_search failed: embedding configuration error'
+    assert tool_result_step.tool_output == {
+        'success': False,
+        'error': 'embedding configuration error',
+        'error_type': 'RuntimeError',
+        'reason': 'embedding configuration error',
     }
 
 
