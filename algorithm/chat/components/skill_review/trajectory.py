@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
 from chat.components.skill_review.schemas import SessionData, SessionMessage, Trajectory, TrajectoryStep
 
 _TOOL_ROLE_NAMES = {'tool', 'function', 'tool_call'}
+_PREFERRED_RESULT_KEYS = (
+    'success',
+    'status',
+    'error',
+    'message',
+    'name',
+    'title',
+    'path',
+    'id',
+    'type',
+    'count',
+    'total',
+    'query',
+    'location',
+    'condition',
+)
 
 
 def build_trajectory(
@@ -21,7 +38,7 @@ def build_trajectory(
     for index, message in enumerate(session.messages, start=1):
         role = _normalize_role(message.role)
         if role == 'user':
-            user_text = _shorten(message.content, 2000)
+            user_text = _compress_user_message(message.content)
             steps.append(
                 TrajectoryStep(
                     step_index=len(steps) + 1,
@@ -45,7 +62,8 @@ def build_trajectory(
                 called_tools.append(tool_name)
             if skill_name:
                 called_skills.append(skill_name)
-            output_text = _shorten(message.content, 2000)
+            tool_output = _compress_tool_output(_extract_tool_output(message))
+            output_text = _summarize_tool_result(tool_name, tool_output)
             steps.append(
                 TrajectoryStep(
                     step_index=len(steps) + 1,
@@ -56,15 +74,16 @@ def build_trajectory(
                     tool_name=tool_name,
                     skill_name=skill_name,
                     message_index=index,
-                    tool_output=_extract_tool_output(message),
+                    tool_output=tool_output,
                     raw=message.raw,
                 )
             )
             continue
 
-        assistant_reasoning = _shorten(_extract_reasoning(message), 4000)
-        assistant_text = _shorten(_extract_assistant_text(message), 4000)
+        assistant_reasoning = _compress_reasoning(_extract_reasoning(message))
+        assistant_text = _compress_assistant_text(_extract_assistant_text(message))
         tool_calls = _extract_tool_calls(message)
+        primary_tool_input = _compress_tool_input(tool_calls[0]['arguments']) if tool_calls else None
         tool_name = message.tool_name or _extract_tool_name(message)
         skill_name = message.skill_name or _extract_skill_name(message)
         if not skill_name:
@@ -80,14 +99,14 @@ def build_trajectory(
                     step_index=len(steps) + 1,
                     role='assistant',
                     kind='assistant_message',
-                    action=assistant_text or assistant_reasoning or '',
-                    state=assistant_reasoning or assistant_text or '',
+                    action=_summarize_assistant_action(assistant_text, assistant_reasoning, tool_calls),
+                    state=_summarize_assistant_state(assistant_text, assistant_reasoning, tool_calls),
                     tool_name=tool_name,
                     skill_name=skill_name,
                     message_index=index,
                     reasoning=assistant_reasoning or None,
                     result=assistant_text or None,
-                    tool_input=tool_calls[0]['arguments'] if tool_calls else None,
+                    tool_input=primary_tool_input,
                     raw=message.raw,
                 )
             )
@@ -95,6 +114,7 @@ def build_trajectory(
         for sub_index, tool_call in enumerate(tool_calls, start=1):
             call_name = str(tool_call.get('name') or '').strip() or None
             call_id = str(tool_call.get('id') or '').strip() or None
+            compact_input = _compress_tool_input(tool_call.get('arguments'))
             if call_name:
                 called_tools.append(call_name)
             if call_id and skill_name:
@@ -104,13 +124,13 @@ def build_trajectory(
                     step_index=len(steps) + 1,
                     role='assistant',
                     kind='tool_call',
-                    action=_shorten(call_name or '', 2000),
+                    action=_summarize_tool_call(call_name, compact_input),
                     state='',
                     tool_name=call_name,
                     skill_name=skill_name,
                     message_index=index,
                     sub_index=sub_index,
-                    tool_input=tool_call.get('arguments'),
+                    tool_input=compact_input,
                     raw=tool_call,
                 )
             )
@@ -289,6 +309,166 @@ def _shorten(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + '...'
+
+
+def _compress_user_message(text: str) -> str:
+    return _normalize_text(text, 600)
+
+
+def _compress_assistant_text(text: str) -> str:
+    return _normalize_text(text, 800)
+
+
+def _compress_reasoning(text: str) -> str:
+    return _normalize_text(text, 500)
+
+
+def _compress_tool_input(value: Any) -> Any:
+    return _compress_payload(value, depth=0, max_items=4)
+
+
+def _compress_tool_output(value: Any) -> Any:
+    return _compress_payload(value, depth=0, max_items=4)
+
+
+def _compress_payload(value: Any, *, depth: int, max_items: int) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parsed = _safe_json_loads(value)
+        if parsed is not value:
+            return _compress_payload(parsed, depth=depth, max_items=max_items)
+        return _normalize_text(value, 500)
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        items = [(str(key), sub_value) for key, sub_value in value.items() if _has_signal(sub_value)]
+        if not items:
+            return {}
+        prioritized = sorted(
+            items,
+            key=lambda item: (
+                0 if item[0] in _PREFERRED_RESULT_KEYS else 1,
+                item[0],
+            ),
+        )
+        compressed: dict[str, Any] = {}
+        for key, sub_value in prioritized[:max_items]:
+            compressed[key] = _compress_payload(sub_value, depth=depth + 1, max_items=3 if depth >= 1 else 4)
+        omitted = len(prioritized) - len(compressed)
+        if omitted > 0:
+            compressed['_truncated'] = omitted
+        return compressed
+    if isinstance(value, list):
+        if not value:
+            return []
+        sample = [
+            _compress_payload(item, depth=depth + 1, max_items=3)
+            for item in value[:max_items]
+        ]
+        if len(value) <= max_items and all(not isinstance(item, (dict, list)) for item in value):
+            return sample
+        if len(value) <= max_items and depth >= 2:
+            return sample
+        return {
+            'count': len(value),
+            'sample': sample,
+        }
+    return _normalize_text(str(value), 500)
+
+
+def _summarize_assistant_action(
+    assistant_text: str,
+    assistant_reasoning: str,
+    tool_calls: list[dict[str, Any]],
+) -> str:
+    if assistant_text:
+        return assistant_text
+    if tool_calls:
+        return _summarize_tool_call(
+            str(tool_calls[0].get('name') or '').strip() or None,
+            _compress_tool_input(tool_calls[0].get('arguments')),
+        )
+    return assistant_reasoning
+
+
+def _summarize_assistant_state(
+    assistant_text: str,
+    assistant_reasoning: str,
+    tool_calls: list[dict[str, Any]],
+) -> str:
+    if assistant_reasoning:
+        return assistant_reasoning
+    if tool_calls:
+        return _normalize_text(
+            f"Preparing tool call: {_summarize_tool_call(str(tool_calls[0].get('name') or '').strip() or None, _compress_tool_input(tool_calls[0].get('arguments')))}",
+            400,
+        )
+    return assistant_text
+
+
+def _summarize_tool_call(tool_name: str | None, tool_input: Any) -> str:
+    name = tool_name or 'tool'
+    compact_input = _summarize_value(tool_input, 220)
+    if compact_input:
+        return _normalize_text(f"Call {name} with {compact_input}", 260)
+    return f"Call {name}"
+
+
+def _summarize_tool_result(tool_name: str | None, tool_output: Any) -> str:
+    name = tool_name or 'tool'
+    summary = _summarize_value(tool_output, 260)
+    if summary:
+        return _normalize_text(f"{name} returned {summary}", 320)
+    return f"{name} returned a result"
+
+
+def _summarize_value(value: Any, limit: int = 260) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key, item in value.items():
+            if key == '_truncated':
+                parts.append(f"{item} more fields")
+                continue
+            if isinstance(item, dict) and 'count' in item and 'sample' in item:
+                parts.append(f"{key}({item['count']} items)")
+                continue
+            if isinstance(item, list):
+                rendered = ', '.join(_normalize_text(str(part), 60) for part in item[:3])
+                if rendered:
+                    parts.append(f"{key}=[{rendered}]")
+                continue
+            rendered = _normalize_text(str(item), 80)
+            if rendered:
+                parts.append(f"{key}={rendered}")
+        return _shorten(', '.join(parts), limit)
+    if isinstance(value, list):
+        rendered = ', '.join(_normalize_text(str(item), 60) for item in value[:3])
+        return _shorten(rendered, limit)
+    return _normalize_text(str(value), limit)
+
+
+def _normalize_text(text: str, limit: int) -> str:
+    value = str(text or '').strip()
+    if not value:
+        return ''
+    value = re.sub(r'```(?:json|text|markdown)?\s*', '', value)
+    value = value.replace('```', ' ')
+    value = re.sub(r'https?://\S+', '[url]', value)
+    value = re.sub(r'\s+', ' ', value).strip()
+    return _shorten(value, limit)
+
+
+def _has_signal(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return bool(value)
+    return True
 
 
 def _assign_task_segments(steps: list[TrajectoryStep]) -> None:

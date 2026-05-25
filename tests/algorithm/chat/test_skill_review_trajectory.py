@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from chat.components.skill_review.craft import build_skill_craft
 from chat.components.skill_review.schemas import SessionData, SessionMessage
 from chat.components.skill_review.trajectory import build_trajectory
 
@@ -12,6 +13,30 @@ def _build_session(messages: list[SessionMessage], session_id: str = 'session-1'
         messages=messages,
         metadata={'user_id': 'user-1'},
     )
+
+
+class _CaptureLLM:
+    def __init__(self) -> None:
+        self.prompt = ''
+
+    def complete_json(self, prompt: str) -> dict:
+        self.prompt = prompt
+        return {
+            'contextual_description': {
+                'task_goal': '测试任务',
+                'applicable_scenario': '测试场景',
+                'execution_summary': '测试摘要',
+                'key_result': '测试结果',
+                'environment': {},
+            },
+            'refined_trajectory': {
+                'steps': [],
+            },
+            'guidelines': {
+                'success_patterns': [],
+                'failure_patterns': [],
+            },
+        }
 
 
 def test_build_trajectory_extracts_user_assistant_tool_and_task_end():
@@ -522,3 +547,150 @@ def test_build_trajectory_infers_skill_name_from_skill_tools():
     assert 'spring-prose-writing' not in trajectory.called_tools
     skill_steps = [step for step in trajectory.steps if step.skill_name == 'spring-prose-writing']
     assert skill_steps
+
+
+def test_build_trajectory_compresses_tool_fields_for_llm_readability():
+    session = _build_session(
+        [
+            SessionMessage(
+                role='user',
+                content='请帮我分析这个很长的结果。',
+                raw={'role': 'user', 'content': '请帮我分析这个很长的结果。'},
+            ),
+            SessionMessage(
+                role='assistant',
+                content='我先调用搜索工具，并重点关注 status、message 和结果列表。',
+                raw={
+                    'role': 'assistant',
+                    'content': '我先调用搜索工具，并重点关注 status、message 和结果列表。',
+                    'reasoning_content': '先确认状态，再看返回的结果列表里有没有可用条目。',
+                    'tool_calls': [
+                        {
+                            'id': 'call_search_1',
+                            'name': 'web_search',
+                            'arguments': {
+                                'query': 'very long query',
+                                'page': 1,
+                                'debug': '',
+                                'metadata': {
+                                    'trace_id': 'abc',
+                                    'session': 's1',
+                                    'extra': 'x',
+                                    'ignored': '',
+                                },
+                                'tags': ['alpha', 'beta', 'gamma', 'delta', 'epsilon'],
+                            },
+                        }
+                    ],
+                },
+            ),
+            SessionMessage(
+                role='tool',
+                content='',
+                tool_name='web_search',
+                raw={
+                    'role': 'tool',
+                    'name': 'web_search',
+                    'result': {
+                        'status': 'ok',
+                        'message': 'found results',
+                        'results': [
+                            {'title': 'Result A', 'snippet': 'A' * 200, 'url': 'https://example.com/a'},
+                            {'title': 'Result B', 'snippet': 'B' * 200, 'url': 'https://example.com/b'},
+                            {'title': 'Result C', 'snippet': 'C' * 200, 'url': 'https://example.com/c'},
+                            {'title': 'Result D', 'snippet': 'D' * 200, 'url': 'https://example.com/d'},
+                            {'title': 'Result E', 'snippet': 'E' * 200, 'url': 'https://example.com/e'},
+                        ],
+                        'debug': {
+                            'raw_html': '<html>...</html>',
+                            'timing_ms': 132,
+                            'extra': 'unused',
+                        },
+                        'unused': '',
+                    },
+                },
+            ),
+        ],
+        session_id='session-compress-tool-fields',
+    )
+
+    trajectory = build_trajectory(
+        session,
+        min_user_turns=1,
+        min_tool_turns=1,
+    )
+
+    assistant_step = trajectory.steps[1]
+    tool_call_step = trajectory.steps[2]
+    tool_result_step = trajectory.steps[3]
+
+    assert assistant_step.reasoning == '先确认状态，再看返回的结果列表里有没有可用条目。'
+    assert tool_call_step.action.startswith('Call web_search with')
+    assert tool_call_step.tool_input == {
+        'metadata': {'extra': 'x', 'session': 's1', 'trace_id': 'abc'},
+        'page': 1,
+        'query': 'very long query',
+        'tags': {'count': 5, 'sample': ['alpha', 'beta', 'gamma', 'delta']},
+    }
+    assert tool_result_step.action.startswith('web_search returned')
+    assert tool_result_step.tool_output == {
+        'message': 'found results',
+        'results': {
+            'count': 5,
+            'sample': [
+                {'snippet': 'A' * 200, 'title': 'Result A', 'url': '[url]'},
+                {'snippet': 'B' * 200, 'title': 'Result B', 'url': '[url]'},
+                {'snippet': 'C' * 200, 'title': 'Result C', 'url': '[url]'},
+                {'snippet': 'D' * 200, 'title': 'Result D', 'url': '[url]'},
+            ],
+        },
+        'status': 'ok',
+        'debug': {'extra': 'unused', 'raw_html': '<html>...</html>', 'timing_ms': 132},
+    }
+
+
+def test_build_skill_craft_filters_step_raw_from_prompt():
+    session = SessionData(
+        session_id='craft-session',
+        source_db='test',
+        tables=[],
+        metadata={'user_id': 'user-1'},
+        messages=[
+            SessionMessage(
+                role='user',
+                content='帮我查天气。',
+                raw={'role': 'user', 'content': '帮我查天气。', 'secret_raw': 'should-not-be-in-prompt'},
+            ),
+            SessionMessage(
+                role='assistant',
+                content='我先查一下。',
+                raw={
+                    'role': 'assistant',
+                    'content': '我先查一下。',
+                    'tool_calls': [
+                        {'id': 'call_weather_1', 'name': 'weather', 'arguments': {'location': 'Shanghai'}}
+                    ],
+                    'secret_raw': 'assistant-hidden',
+                },
+            ),
+            SessionMessage(
+                role='tool',
+                content='{"condition":"晴"}',
+                raw={
+                    'role': 'tool',
+                    'name': 'weather',
+                    'content': '{"condition":"晴"}',
+                    'secret_raw': 'tool-hidden',
+                },
+            ),
+        ],
+    )
+    trajectory = build_trajectory(session, min_user_turns=1, min_tool_turns=1)
+    llm = _CaptureLLM()
+
+    build_skill_craft(trajectory, llm)
+
+    assert 'secret_raw' not in llm.prompt
+    assert '"raw"' not in llm.prompt
+    assert '"tool_output"' in llm.prompt
+    assert '"action"' in llm.prompt

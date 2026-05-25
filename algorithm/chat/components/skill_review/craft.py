@@ -14,7 +14,7 @@ from chat.prompts.skill_review import craft_prompt
 
 def build_skill_craft(trajectory: Trajectory, llm: SkillReviewLLM) -> SkillDraft:
     try:
-        payload = llm.complete_json(craft_prompt(trajectory.model_dump()))
+        payload = llm.complete_json(craft_prompt(_trajectory_payload_for_craft(trajectory)))
         return SkillDraft.model_validate(payload)
     except Exception:
         return _fallback_craft(trajectory)
@@ -51,3 +51,7 @@ def _fallback_craft(trajectory: Trajectory) -> SkillDraft:
             failure_patterns=[],
         ),
     )
+
+
+def _trajectory_payload_for_craft(trajectory: Trajectory) -> dict:
+    return trajectory.model_dump(exclude={'steps': {'__all__': {'raw'}}})
