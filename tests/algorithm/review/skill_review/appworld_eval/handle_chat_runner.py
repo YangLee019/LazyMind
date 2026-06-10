@@ -1,0 +1,506 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import logging
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator
+
+try:
+    from lazyllm import LOG
+except ModuleNotFoundError:
+    LOG = logging.getLogger(__name__)
+
+from .appworld_tool import APPWORLD_TOOL_NAMES
+from .history_db import insert_chat_history_row
+from .metrics import MAX_STEP_ERROR, compute_metrics
+from .prompt import APPWORLD_SYSTEM_PROMPT
+
+
+def _build_flat_appworld_tool_group(tool: Any) -> Any:
+    """Build a LazyLLM tool group whose callable names stay unprefixed."""
+    from lazyllm.tools.agent.toolsManager import ToolGroup
+
+    return ToolGroup(
+        tools=[
+            tool.appworld_execute,
+            tool.appworld_task_info,
+            tool.appworld_api_docs,
+            tool.appworld_status,
+        ],
+        name='appworld_eval',
+        desc='Run AppWorld benchmark environment tools.',
+        lazy=False,
+        prefix=False,
+    )
+
+
+@contextmanager
+def register_appworld_tool(tool: Any):
+    """Ensure AppWorld tools are visible to handle_chat during this run."""
+    from lazymind.chat.service import chat_service
+    from lazymind.chat.service.component import ToolGroupConfig
+
+    original_tools = list(chat_service.DEFAULT_TOOLS)
+    original_build_system_prompt = chat_service.build_system_prompt
+
+    def build_appworld_system_prompt(active_groups: set[str], **kwargs: Any) -> str:
+        prompt = original_build_system_prompt(active_groups, **kwargs)
+        if 'appworld_eval' not in active_groups:
+            return prompt
+        if '## AppWorld Task Mode' in prompt or '## AppWorld Benchmark Rules' in prompt:
+            return prompt
+        return f'{prompt}\n\n## AppWorld Benchmark Rules\n{APPWORLD_SYSTEM_PROMPT}'
+
+    def tool_group_names(cfg: Any) -> set[str]:
+        aliases = getattr(cfg, 'aliases', ()) or ()
+        if isinstance(aliases, str):
+            aliases = (aliases,)
+        return {str(getattr(cfg, 'name', '')), *(str(alias) for alias in aliases)}
+
+    has_appworld_group = any(
+        not tool_group_names(cfg).isdisjoint({'appworld_eval', *APPWORLD_TOOL_NAMES})
+        for cfg in chat_service.DEFAULT_TOOLS
+    )
+    if not has_appworld_group:
+        tool_group_kwargs = {
+            'name': 'appworld_eval',
+            'label': 'AppWorld',
+            'description': 'Run AppWorld benchmark environment tools.',
+            'instance': _build_flat_appworld_tool_group(tool),
+        }
+        if 'aliases' in inspect.signature(ToolGroupConfig).parameters:
+            tool_group_kwargs['aliases'] = tuple(APPWORLD_TOOL_NAMES)
+        chat_service.DEFAULT_TOOLS.append(ToolGroupConfig(**tool_group_kwargs))
+    chat_service.build_system_prompt = build_appworld_system_prompt
+    try:
+        yield
+    finally:
+        chat_service.DEFAULT_TOOLS[:] = original_tools
+        chat_service.build_system_prompt = original_build_system_prompt
+
+
+async def run_appworld_eval_with_handle_chat(
+    tool: Any,
+    task_ids: list[str],
+    max_steps: int = 200,
+    *,
+    session_prefix: str = 'appworld-eval',
+    create_user_id: str = 'appworld_eval',
+    create_user_name: str = '',
+    model_config: dict[str, Any] | None = None,
+    tool_config: dict[str, str] | None = None,
+    persist_history: bool = True,
+) -> dict[str, Any]:
+    """Run AppWorld tasks through chat_service.handle_chat."""
+    planned_task_ids = [str(task_id).strip() for task_id in task_ids if str(task_id).strip()]
+    if not planned_task_ids:
+        raise ValueError('task_ids must contain at least one AppWorld task id')
+    if max_steps < 1:
+        raise ValueError('max_steps must be >= 1')
+
+    results: list[dict[str, Any]] = []
+    history_rows: list[dict[str, Any]] = []
+    with register_appworld_tool(tool):
+        for episode_index, task_id in enumerate(planned_task_ids, start=1):
+            result, history_row = await _run_single_handle_chat_task(
+                tool=tool,
+                episode_index=episode_index,
+                task_id=task_id,
+                max_steps=max_steps,
+                session_id=str(uuid.uuid4()),
+                session_prefix=session_prefix,
+                create_user_id=create_user_id,
+                model_config=model_config,
+                tool_config=tool_config,
+            )
+            results.append(result)
+            history_rows.append(history_row)
+            if persist_history:
+                insert_chat_history_row(
+                    history_row,
+                    create_user_id=create_user_id,
+                    create_user_name=create_user_name or create_user_id,
+                )
+                LOG.info('[AppWorldEval] inserted chat history row successfully')
+
+    return {
+        'results': results,
+        'metrics': compute_metrics(results),
+        'chat_histories': history_rows,
+    }
+
+
+def run_appworld_eval_with_handle_chat_sync(
+    tool: Any,
+    task_ids: list[str],
+    max_steps: int = 200,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    return asyncio.run(
+        run_appworld_eval_with_handle_chat(
+            tool=tool,
+            task_ids=task_ids,
+            max_steps=max_steps,
+            **kwargs,
+        )
+    )
+
+
+async def _run_single_handle_chat_task(
+    *,
+    tool: Any,
+    episode_index: int,
+    task_id: str,
+    max_steps: int,
+    session_id: str,
+    session_prefix: str,
+    create_user_id: str,
+    model_config: dict[str, Any] | None,
+    tool_config: dict[str, str] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    final_payloads: list[dict[str, Any]] = []
+    query = ''
+    prepare_data: dict[str, Any] = {}
+    task_status: dict[str, Any] = {}
+    evaluation_payload: dict[str, Any] = {}
+    runtime: dict[str, Any] = {}
+    error: str | None = None
+    session_started_at = _utc_now_iso()
+    original_max_interactions = getattr(tool, 'max_interactions', None)
+    try:
+        if original_max_interactions is None:
+            tool.max_interactions = max_steps
+
+        prepare_data = tool.prepare(session_id=session_id, task_id=task_id)
+        task_info = prepare_data.get('task_info') if isinstance(prepare_data.get('task_info'), dict) else {}
+        query = _build_task_query(prepare_data)
+        print(f'[AppWorldEval] prepared task={task_id}: {query[:200]}')
+
+        from lazymind.chat.service.chat_service import handle_chat
+
+        environment_context = tool.environment_context(task_id=task_id, task_info=task_info)
+
+        handle_chat_kwargs = {
+            'query': query,
+            'history': [],
+            'session_id': session_id,
+            'filters': {},
+            'files': [],
+            'debug': False,
+            'reasoning': True,
+            'databases': [],
+            'dataset': None,
+            'priority': None,
+            'available_tools': ['appworld_eval'],
+            'available_skills': [],
+            'memory': None,
+            'user_preference': None,
+            'use_memory': False,
+            'trace': False,
+            'environment_context': environment_context,
+            'user_id': create_user_id,
+            'model_config': model_config,
+            'tool_config': tool_config,
+        }
+        signature = inspect.signature(handle_chat)
+        if not any(param.kind == param.VAR_KEYWORD for param in signature.parameters.values()):
+            handle_chat_kwargs = {
+                key: value for key, value in handle_chat_kwargs.items() if key in signature.parameters
+            }
+        response = await handle_chat(**handle_chat_kwargs)
+        final_payloads = [payload async for payload in _iter_payloads(response)]
+        runtime = _extract_runtime(final_payloads)
+        error = _extract_error(final_payloads)
+
+        task_status = _safe_call_dict(lambda: tool.status(session_id))
+        if not runtime:
+            runtime = _extract_status_trace(task_status)
+        evaluation_payload = _safe_call_dict(lambda: tool.evaluate(session_id))
+        if error is None:
+            error = _extract_control_error(task_status, evaluation_payload)
+
+        steps = _extract_step_count(task_status, runtime)
+        completed = _extract_completed(task_status, runtime)
+        if error is None and not completed and steps >= max_steps:
+            error = MAX_STEP_ERROR
+
+        result = _task_result(
+            episode_index=episode_index,
+            task_id=task_id,
+            task_status=task_status,
+            evaluation_payload=evaluation_payload,
+            runtime=runtime,
+            error=error,
+        )
+        return result, _build_chat_history_row(
+            episode_index=episode_index,
+            task_id=task_id,
+            session_id=session_id,
+            query=query,
+            payloads=final_payloads,
+            result=result,
+            prepare_data=prepare_data,
+            task_status=task_status,
+            evaluation_payload=evaluation_payload,
+            runtime=runtime,
+            create_time=session_started_at,
+            session_prefix=session_prefix,
+        )
+    except Exception as exc:
+        error = str(exc)
+        if 'max_interactions' in error or 'max_steps' in error:
+            error = MAX_STEP_ERROR
+        result = _task_result(
+            episode_index=episode_index,
+            task_id=task_id,
+            task_status=task_status,
+            evaluation_payload=evaluation_payload,
+            runtime=runtime,
+            error=error,
+        )
+        return result, _build_chat_history_row(
+            episode_index=episode_index,
+            task_id=task_id,
+            session_id=session_id,
+            query=query,
+            payloads=final_payloads,
+            result=result,
+            prepare_data=prepare_data,
+            task_status=task_status,
+            evaluation_payload=evaluation_payload,
+            runtime=runtime,
+            create_time=session_started_at,
+            session_prefix=session_prefix,
+        )
+    finally:
+        tool.max_interactions = original_max_interactions
+        try:
+            tool.cleanup(session_id)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f'[AppWorldEval] cleanup skipped for session={session_id}: {exc}')
+
+
+def _build_task_query(prepare_data: dict[str, Any]) -> str:
+    task_info = prepare_data.get('task_info') if isinstance(prepare_data.get('task_info'), dict) else {}
+    instruction = str(task_info.get('instruction') or prepare_data.get('prepared_query') or '').strip()
+    if instruction:
+        return instruction
+    return 'Use appworld_task_info() to inspect the prepared AppWorld task, then complete it.'
+
+
+async def _iter_payloads(response: Any) -> AsyncIterator[dict[str, Any]]:
+    if isinstance(response, dict):
+        yield response
+        return
+    body_iterator = getattr(response, 'body_iterator', None)
+    if body_iterator is None:
+        return
+    async for chunk in body_iterator:
+        text = chunk.decode('utf-8') if isinstance(chunk, bytes) else str(chunk)
+        for block in text.strip().split('\n\n'):
+            line = block.strip()
+            if not line:
+                continue
+            if line.startswith('data:'):
+                line = line.removeprefix('data:').strip()
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                yield payload
+
+
+def _extract_error(payloads: list[dict[str, Any]]) -> str | None:
+    for payload in reversed(payloads):
+        if payload.get('code') == 500:
+            return str(payload.get('msg') or 'handle_chat failed')
+    return None
+
+
+def _extract_runtime(payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    for payload in reversed(payloads):
+        data = payload.get('data')
+        if not isinstance(data, dict):
+            continue
+        runtime = data.get('runtime')
+        if isinstance(runtime, dict):
+            return runtime
+    return {}
+
+
+def _extract_status_trace(task_status: dict[str, Any]) -> dict[str, Any]:
+    trace = task_status.get('trace')
+    return trace if isinstance(trace, dict) else {}
+
+
+def _safe_call_dict(callback: Any) -> dict[str, Any]:
+    try:
+        value = callback()
+    except Exception as exc:  # noqa: BLE001
+        return {'error': str(exc)}
+    return value if isinstance(value, dict) else {}
+
+
+def _extract_control_error(*payloads: dict[str, Any]) -> str | None:
+    for payload in payloads:
+        value = payload.get('error')
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_step_count(task_status: dict[str, Any], runtime: dict[str, Any]) -> int:
+    for value in (
+        task_status.get('interaction_count'),
+        _nested_get(runtime, 'environment_final', 'status', 'interaction_count'),
+    ):
+        if isinstance(value, (int, float)):
+            return int(value)
+    tool_trace = runtime.get('tool_trace')
+    if isinstance(tool_trace, list):
+        return sum(
+            1
+            for item in tool_trace
+            if isinstance(item, dict) and item.get('tool_name') == 'appworld_execute'
+        )
+    environment_trace = runtime.get('environment_trace')
+    if isinstance(environment_trace, list):
+        return len(environment_trace)
+    return 0
+
+
+def _extract_completed(task_status: dict[str, Any], runtime: dict[str, Any]) -> bool:
+    for value in (
+        task_status.get('completed'),
+        _nested_get(runtime, 'environment_final', 'status', 'completed'),
+    ):
+        if isinstance(value, bool):
+            return value
+    return False
+
+
+def _extract_evaluation(evaluation_payload: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    evaluation = evaluation_payload.get('evaluation')
+    if isinstance(evaluation, dict):
+        return evaluation
+    evaluation = _nested_get(runtime, 'environment_final', 'evaluation')
+    return evaluation if isinstance(evaluation, dict) else {}
+
+
+def _nested_get(value: dict[str, Any], *keys: str) -> Any:
+    current: Any = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _build_chat_history_row(
+    *,
+    episode_index: int,
+    task_id: str,
+    session_id: str,
+    query: str,
+    payloads: list[dict[str, Any]],
+    result: dict[str, Any],
+    prepare_data: dict[str, Any],
+    task_status: dict[str, Any],
+    evaluation_payload: dict[str, Any],
+    runtime: dict[str, Any],
+    create_time: str,
+    session_prefix: str,
+) -> dict[str, Any]:
+    text, reasoning_content, sources = _collect_stream_parts(payloads)
+    update_time = _utc_now_iso()
+    ext = {
+        'benchmark': 'appworld',
+        'episode_index': episode_index,
+        'task_id': task_id,
+        'session_id': session_id,
+        'session_prefix': session_prefix,
+        'success': result.get('success'),
+        'steps': result.get('steps'),
+        'completed': result.get('completed'),
+        'error': result.get('error'),
+        'prepare': prepare_data,
+        'task_status': task_status,
+        'evaluation': evaluation_payload,
+        'runtime': runtime,
+        'sse_payloads': payloads,
+    }
+    ext['reasoning_content'] = reasoning_content
+
+    return {
+        'id': f'h_appworld_{uuid.uuid4().hex[:24]}',
+        'seq': episode_index,
+        'conversation_id': session_id,
+        'raw_content': query,
+        'retrieval_result': {'sources': sources or None},
+        'content': query,
+        'result': _format_backend_result(text),
+        'feed_back': 0,
+        'reason': '',
+        'expected_answer': '',
+        'ext': ext,
+        'version': '2.3',
+        'create_time': create_time,
+        'update_time': update_time,
+    }
+
+
+def _collect_stream_parts(payloads: list[dict[str, Any]]) -> tuple[str, str, list[dict[str, Any]]]:
+    text_parts: list[str] = []
+    think_parts: list[str] = []
+    sources: list[dict[str, Any]] = []
+    for payload in payloads:
+        data = payload.get('data')
+        if not isinstance(data, dict):
+            continue
+        if data.get('text'):
+            text_parts.append(str(data.get('text')))
+        if data.get('think'):
+            think_parts.append(str(data.get('think')))
+        if isinstance(data.get('sources'), list) and data.get('sources'):
+            sources.extend(data['sources'])
+    return ''.join(text_parts), ''.join(think_parts), sources
+
+
+def _format_backend_result(text: str) -> str:
+    normalized = str(text or '')
+    if not normalized:
+        return ''
+    return normalized if normalized.startswith('\n\n') else f'\n\n{normalized.lstrip()}'
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _task_result(
+    *,
+    episode_index: int,
+    task_id: str,
+    task_status: dict[str, Any],
+    evaluation_payload: dict[str, Any],
+    runtime: dict[str, Any],
+    error: str | None,
+) -> dict[str, Any]:
+    evaluation = _extract_evaluation(evaluation_payload, runtime)
+    steps = _extract_step_count(task_status, runtime)
+    completed = _extract_completed(task_status, runtime)
+    return {
+        'episode_index': episode_index,
+        'task_id': task_id,
+        'success': error is None and bool(evaluation.get('success') is True),
+        'steps': steps,
+        'completed': completed,
+        'evaluation': evaluation,
+        'task_status': {key: value for key, value in task_status.items() if key != 'trace'},
+        'error': error,
+    }
