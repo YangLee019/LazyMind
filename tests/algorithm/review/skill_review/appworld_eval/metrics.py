@@ -28,6 +28,13 @@ def compute_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
 
     total_steps = sum(int(result.get('steps') or 0) for result in results)
     success_steps = sum(int(result.get('steps') or 0) for result in success_results)
+    total_tool_call_rounds = sum(_tool_call_rounds(result) for result in results)
+    completed_tool_call_rounds = sum(_tool_call_rounds(result) for result in results if bool(result.get('completed')))
+    handle_chat_turn_values = [
+        int(result.get('handle_chat_tool_call_turns') or 0)
+        for result in results
+        if result.get('handle_chat_tool_call_turns') is not None
+    ]
 
     total_tests = 0
     total_passes = 0
@@ -48,11 +55,28 @@ def compute_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         'success_rate': success_count / total_tasks if total_tasks else 0.0,
         'completed_count': completed_count,
         'completed_rate': completed_count / total_tasks if total_tasks else 0.0,
+        'completion_rate': completed_count / total_tasks if total_tasks else 0.0,
         'avg_steps': total_steps / total_tasks if total_tasks else 0.0,
         'avg_success_steps': success_steps / success_count if success_count else 0.0,
+        'total_tool_call_rounds': total_tool_call_rounds,
+        'avg_tool_call_rounds': total_tool_call_rounds / total_tasks if total_tasks else 0.0,
+        'avg_completed_tool_call_rounds': (
+            completed_tool_call_rounds / completed_count if completed_count else 0.0
+        ),
+        'max_tool_call_rounds': max((_tool_call_rounds(result) for result in results), default=0),
+        'total_handle_chat_tool_call_turns': sum(handle_chat_turn_values),
+        'avg_handle_chat_tool_call_turns': (
+            sum(handle_chat_turn_values) / len(handle_chat_turn_values)
+            if handle_chat_turn_values else 0.0
+        ),
+        'max_handle_chat_tool_call_turns': max(handle_chat_turn_values, default=0),
         'max_step_failure_rate': max_step_failures / total_tasks if total_tasks else 0.0,
         'error_count': error_count,
         'total_tests': total_tests,
         'total_passes': total_passes,
         'test_pass_rate': total_passes / total_tests if total_tests else None,
     }
+
+
+def _tool_call_rounds(result: dict[str, Any]) -> int:
+    return int(result.get('tool_call_rounds', result.get('steps') or 0) or 0)

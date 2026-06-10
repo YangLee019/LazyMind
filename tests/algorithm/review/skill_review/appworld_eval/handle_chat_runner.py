@@ -180,39 +180,18 @@ async def _run_single_handle_chat_task(
         query = _build_task_query(prepare_data)
         print(f'[AppWorldEval] prepared task={task_id}: {query[:200]}')
 
-        from lazymind.chat.service.chat_service import handle_chat
-
         environment_context = tool.environment_context(task_id=task_id, task_info=task_info)
 
-        handle_chat_kwargs = {
-            'query': query,
-            'history': [],
-            'session_id': session_id,
-            'filters': {},
-            'files': [],
-            'debug': False,
-            'reasoning': True,
-            'databases': [],
-            'dataset': None,
-            'priority': None,
-            'available_tools': ['appworld_eval'],
-            'available_skills': [],
-            'memory': None,
-            'user_preference': None,
-            'use_memory': False,
-            'trace': False,
-            'environment_context': environment_context,
-            'user_id': create_user_id,
-            'model_config': model_config,
-            'tool_config': tool_config,
-        }
-        signature = inspect.signature(handle_chat)
-        if not any(param.kind == param.VAR_KEYWORD for param in signature.parameters.values()):
-            handle_chat_kwargs = {
-                key: value for key, value in handle_chat_kwargs.items() if key in signature.parameters
-            }
-        response = await handle_chat(**handle_chat_kwargs)
+        response = await _call_handle_chat(
+            query=query,
+            session_id=session_id,
+            create_user_id=create_user_id,
+            environment_context=environment_context,
+            model_config=model_config,
+            tool_config=tool_config,
+        )
         final_payloads = [payload async for payload in _iter_payloads(response)]
+        service_tool_call_turns = _extract_service_tool_call_turns(final_payloads)
         runtime = _extract_runtime(final_payloads)
         error = _extract_error(final_payloads)
 
@@ -235,6 +214,7 @@ async def _run_single_handle_chat_task(
             evaluation_payload=evaluation_payload,
             runtime=runtime,
             error=error,
+            service_tool_call_turns=service_tool_call_turns,
         )
         return result, _build_chat_history_row(
             episode_index=episode_index,
@@ -261,6 +241,7 @@ async def _run_single_handle_chat_task(
             evaluation_payload=evaluation_payload,
             runtime=runtime,
             error=error,
+            service_tool_call_turns=None,
         )
         return result, _build_chat_history_row(
             episode_index=episode_index,
@@ -282,6 +263,59 @@ async def _run_single_handle_chat_task(
             tool.cleanup(session_id)
         except Exception as exc:  # noqa: BLE001
             LOG.warning(f'[AppWorldEval] cleanup skipped for session={session_id}: {exc}')
+
+
+async def _call_handle_chat(
+    *,
+    query: str,
+    session_id: str,
+    create_user_id: str,
+    environment_context: dict[str, Any],
+    model_config: dict[str, Any] | None,
+    tool_config: dict[str, Any] | None,
+) -> Any:
+    from lazymind.chat.service import chat_service
+
+    signature = inspect.signature(chat_service.handle_chat)
+    kwargs: dict[str, Any] = {
+        'query': query,
+        'history': [],
+        'session_id': session_id,
+        'filters': {},
+        'files': [],
+        'debug': False,
+        'reasoning': True,
+        'databases': [],
+        'dataset': None,
+        'priority': None,
+        'available_tools': ['appworld_eval'],
+        'disabled_tools': _disabled_tools_except_appworld(chat_service.DEFAULT_TOOLS),
+        'available_skills': [],
+        'memory': None,
+        'user_preference': None,
+        'use_memory': False,
+        'trace': False,
+        'environment_context': environment_context,
+        'user_id': create_user_id,
+        'model_config': model_config,
+        'tool_config': tool_config,
+    }
+    if not any(param.kind == param.VAR_KEYWORD for param in signature.parameters.values()):
+        kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in signature.parameters
+        }
+    return await chat_service.handle_chat(**kwargs)
+
+
+def _disabled_tools_except_appworld(configs: list[Any]) -> list[str]:
+    disabled: list[str] = []
+    for cfg in configs:
+        name = str(getattr(cfg, 'name', '') or '')
+        if name and name != 'appworld_eval':
+            disabled.append(name)
+    return disabled
 
 
 def _build_task_query(prepare_data: dict[str, Any]) -> str:
@@ -319,6 +353,17 @@ def _extract_error(payloads: list[dict[str, Any]]) -> str | None:
     for payload in reversed(payloads):
         if payload.get('code') == 500:
             return str(payload.get('msg') or 'handle_chat failed')
+    return None
+
+
+def _extract_service_tool_call_turns(payloads: list[dict[str, Any]]) -> int | None:
+    for payload in reversed(payloads):
+        data = payload.get('data')
+        if isinstance(data, dict) and 'tool_call_turns' in data:
+            try:
+                return int(data.get('tool_call_turns') or 0)
+            except (TypeError, ValueError):
+                return None
     return None
 
 
@@ -426,6 +471,8 @@ def _build_chat_history_row(
         'session_prefix': session_prefix,
         'success': result.get('success'),
         'steps': result.get('steps'),
+        'tool_call_rounds': result.get('tool_call_rounds'),
+        'handle_chat_tool_call_turns': result.get('handle_chat_tool_call_turns'),
         'completed': result.get('completed'),
         'error': result.get('error'),
         'prepare': prepare_data,
@@ -490,6 +537,7 @@ def _task_result(
     evaluation_payload: dict[str, Any],
     runtime: dict[str, Any],
     error: str | None,
+    service_tool_call_turns: int | None,
 ) -> dict[str, Any]:
     evaluation = _extract_evaluation(evaluation_payload, runtime)
     steps = _extract_step_count(task_status, runtime)
@@ -499,6 +547,8 @@ def _task_result(
         'task_id': task_id,
         'success': error is None and bool(evaluation.get('success') is True),
         'steps': steps,
+        'tool_call_rounds': steps,
+        'handle_chat_tool_call_turns': service_tool_call_turns,
         'completed': completed,
         'evaluation': evaluation,
         'task_status': {key: value for key, value in task_status.items() if key != 'trace'},
