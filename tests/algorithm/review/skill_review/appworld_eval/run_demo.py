@@ -8,14 +8,20 @@ from pathlib import Path
 
 
 def _bootstrap_repo_imports() -> None:
-    package_parent = Path(__file__).resolve().parent.parent
-    lazyrag_root = package_parent / 'LazyRAG'
+    current = Path(__file__).resolve()
+
+    package_parent = next(
+        p for p in [current.parent, *current.parents]
+        if p.name == 'LazyRAG' or p.name == 'LazyMind'
+    )
+    lazyrag_root = package_parent
     extra_pythonpath = os.getenv('APPWORLD_EVAL_EXTRA_PYTHONPATH', '')
     paths = [
         *(Path(path).expanduser() for path in extra_pythonpath.split(':') if path.strip()),
         package_parent,
         lazyrag_root / 'algorithm' / 'lazyllm',
         lazyrag_root / 'algorithm',
+        lazyrag_root / 'tests' / 'algorithm' / 'review' / 'skill_review'
     ]
     for path in reversed(paths):
         text = str(path)
@@ -30,7 +36,7 @@ from appworld_eval.appworld_tool import AppWorldTool
 from appworld_eval.env_loader import plan_task_ids
 
 
-CREATE_USER_ID = '49437df8-55ed-4533-8afe-7efe4950a3b0'
+CREATE_USER_ID = 'appworld-5'
 CREATE_USER_NAME = 'eval'
 
 
@@ -53,6 +59,21 @@ def _load_model_config(raw: str | None) -> dict | None:
     if not isinstance(value, dict):
         raise ValueError('model_config must be a JSON/YAML object')
     return value
+
+model_config = {
+    "llm": {
+        "source": "openai",
+        "model": "minimax-m27",
+        "base_url": "http://106.75.235.251:9000/v1/",
+        "api_key": "sk-maas-GDZmEQsilc4uGXXTaWnIHmET9V0eenZ8F6eWk3LaPzE"
+    },
+    "embed_main": {
+        "source": "openai",
+        "model": "lazyllm",
+        "base_url": "http://localhost:9800/v1/embeddings",
+        "skip_auth": True
+    }
+}
 
 
 def _require_env(name: str) -> str:
@@ -88,7 +109,7 @@ def main() -> None:
         max_steps=200,
         create_user_id=CREATE_USER_ID,
         create_user_name=CREATE_USER_NAME,
-        model_config=_load_model_config(args.model_config),
+        model_config=model_config,
         persist_history=True,
     )
     print(json.dumps(summary['metrics'], ensure_ascii=False, indent=2))
@@ -96,3 +117,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
