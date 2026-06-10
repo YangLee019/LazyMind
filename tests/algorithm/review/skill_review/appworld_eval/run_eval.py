@@ -30,8 +30,8 @@ from appworld_eval.appworld_tool import AppWorldTool
 from appworld_eval.env_loader import SUPPORTED_DATASETS, plan_task_ids
 
 
-CREATE_USER_ID = '49437df8-55ed-4533-8afe-7efe4950a3b0'
-CREATE_USER_NAME = 'eval'
+CREATE_USER_ID = '2f019fad-c981-46f1-9b5e-f7a1515a4340'
+CREATE_USER_NAME = 'train'
 
 
 def _load_model_config(raw: str | None) -> dict | None:

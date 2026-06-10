@@ -33,12 +33,24 @@ env = env.init_env(batch_size=1)
 
 默认 split 为 `eval_out_of_distribution`。
 
+从 `LazyRAG` 根目录直接运行脚本时，需要显式设置：
+
+```bash
+cd /path/to/LazyRAG
+export ALFWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
+```
+
+否则脚本内的兼容导入路径可能找不到 `algorithm/lazymind`，报 `ModuleNotFoundError: No module named 'lazymind'`。
+
 ## 演示
 
 ```bash
-python ./alfworld_eval/run_demo.py /path/to/alfworld/configs/base_config.yaml \
+cd /path/to/LazyRAG
+export ALFWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
+
+python tests/algorithm/review/skill_review/alfworld_eval/run_demo.py /path/to/alfworld/configs/base_config.yaml \
   --split train \
-  --model-config /path/to/model_config.yaml
+  --model-config "$PWD/algorithm/lazymind/common/runtime_models.inner.yaml"
 ```
 
 该命令会运行一个任务，并打印每个任务的结果及汇总指标。运行过程中会直接写入 `conversations` 和 `chat_histories` 表。
@@ -56,14 +68,20 @@ CREATE_USER_NAME = "ALFWorld Eval"
 如果需要指定 `handle_chat` 的 `model_config`，可以传 JSON 字符串或 JSON/YAML 文件路径：
 
 ```bash
-python ./alfworld_eval/run_demo.py /path/to/alfworld/configs/base_config.yaml \
-  --model-config /path/to/model_config.yaml
+cd /path/to/LazyRAG
+export ALFWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
+
+python tests/algorithm/review/skill_review/alfworld_eval/run_demo.py /path/to/alfworld/configs/base_config.yaml \
+  --model-config "$PWD/algorithm/lazymind/common/runtime_models.inner.yaml"
 ```
 
 ## 批量评测
 
 ```bash
-python ./alfworld_eval/run_eval.py /path/to/alfworld/configs/base_config.yaml \
+cd /path/to/LazyRAG
+export ALFWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
+
+python tests/algorithm/review/skill_review/alfworld_eval/run_eval.py /path/to/alfworld/configs/base_config.yaml \
   --split eval_out_of_distribution \
   --num-tasks 100 \
   --seed 42 \
@@ -74,7 +92,10 @@ python ./alfworld_eval/run_eval.py /path/to/alfworld/configs/base_config.yaml \
 同样支持透传 `model_config`：
 
 ```bash
-python ./alfworld_eval/run_eval.py /path/to/alfworld/configs/base_config.yaml \
+cd /path/to/LazyRAG
+export ALFWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
+
+python tests/algorithm/review/skill_review/alfworld_eval/run_eval.py /path/to/alfworld/configs/base_config.yaml \
   --split train \
   --num-tasks 100 \
   --seed 42 \

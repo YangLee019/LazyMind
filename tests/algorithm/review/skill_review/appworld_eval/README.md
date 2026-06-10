@@ -52,7 +52,9 @@ appworld serve apis --port 19000 --root /path/to/appworld/root
 常用配置项如下：
 
 ```bash
-source appworld_eval/appworld_env.sh
+cd /path/to/LazyRAG
+source tests/algorithm/review/skill_review/appworld_eval/appworld_env.sh
+export APPWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
 ```
 
 `appworld_env.sh` 中包含以下环境变量，可按机器环境修改：
@@ -68,6 +70,14 @@ APPWORLD_EVAL_EXTRA_PYTHONPATH=
 
 也可以不使用 shell 文件，直接在 `run_eval.py` 中传 `--data-root`、`--repo-root`、`--environment-url`、`--apis-url`。
 
+从 `LazyRAG` 根目录直接运行脚本时，需要显式设置：
+
+```bash
+export APPWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
+```
+
+否则脚本内的兼容导入路径可能找不到 `algorithm/lazymind`，报 `ModuleNotFoundError: No module named 'lazymind'`。
+
 默认 dataset 为 `dev`，支持 `train`、`dev`、`test_normal`、`test_challenge`。
 任务 ID 来自：
 
@@ -78,9 +88,12 @@ APPWORLD_EVAL_EXTRA_PYTHONPATH=
 ## 演示
 
 ```bash
-source appworld_eval/appworld_env.sh
-python appworld_eval/run_demo.py \
-  --model-config /path/to/model_config.yaml
+cd /path/to/LazyRAG
+source tests/algorithm/review/skill_review/appworld_eval/appworld_env.sh
+export APPWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
+
+python tests/algorithm/review/skill_review/appworld_eval/run_demo.py \
+  --model-config "$PWD/algorithm/lazymind/common/runtime_models.inner.yaml"
 ```
 
 该命令会从 `dev` split 取 1 个任务，并打印汇总指标。运行过程中会直接写入 `conversations` 和 `chat_histories` 表。
@@ -105,13 +118,16 @@ CREATE_USER_NAME = "AppWorld Demo"
 
 按需改成你的用户即可。数据库连接沿用 LazyMind 配置，优先读取 `LAZYMIND_CORE_DATABASE_URL`，其次读取 `LAZYMIND_DATABASE_URL`。
 
-如果你的 LazyMind/LazyRAG 源码不在 `appworld_eval` 同级的 `LazyRAG/algorithm` 下，可以在 `appworld_env.sh` 中设置 `APPWORLD_EVAL_EXTRA_PYTHONPATH`，作用等同于旧 demo 里手动追加 `sys.path`，但不会把某个人机器上的路径写死进 Python 文件。
+如果你的 LazyMind/LazyRAG 源码不在当前 `LazyRAG/algorithm` 下，可以在 `appworld_env.sh` 中设置 `APPWORLD_EVAL_EXTRA_PYTHONPATH`，作用等同于旧 demo 里手动追加 `sys.path`，但不会把某个人机器上的路径写死进 Python 文件。
 
 ## 批量评测
 
 ```bash
-source appworld_eval/appworld_env.sh
-python appworld_eval/run_eval.py \
+cd /path/to/LazyRAG
+source tests/algorithm/review/skill_review/appworld_eval/appworld_env.sh
+export APPWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
+
+python tests/algorithm/review/skill_review/appworld_eval/run_eval.py \
   --dataset dev \
   --episodes 50 \
   --seed 42 \
@@ -121,8 +137,11 @@ python appworld_eval/run_eval.py \
 也可以指定具体任务：
 
 ```bash
-source appworld_eval/appworld_env.sh
-python appworld_eval/run_eval.py \
+cd /path/to/LazyRAG
+source tests/algorithm/review/skill_review/appworld_eval/appworld_env.sh
+export APPWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
+
+python tests/algorithm/review/skill_review/appworld_eval/run_eval.py \
   --task-id 0a1b2c3d \
   --max-steps 200
 ```
@@ -130,11 +149,14 @@ python appworld_eval/run_eval.py \
 同样支持透传 `model_config`：
 
 ```bash
-source appworld_eval/appworld_env.sh
-python appworld_eval/run_eval.py \
+cd /path/to/LazyRAG
+source tests/algorithm/review/skill_review/appworld_eval/appworld_env.sh
+export APPWORLD_EVAL_EXTRA_PYTHONPATH="$PWD/algorithm:$PWD/algorithm/lazyllm"
+
+python tests/algorithm/review/skill_review/appworld_eval/run_eval.py \
   --dataset dev \
   --episodes 10 \
-  --model-config /path/to/model_config.yaml
+  --model-config "$PWD/algorithm/lazymind/common/runtime_models.inner.yaml"
 ```
 
 常用参数：
