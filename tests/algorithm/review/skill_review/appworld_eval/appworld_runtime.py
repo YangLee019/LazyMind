@@ -198,15 +198,66 @@ def _compact_api_doc(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _detailed_api_doc(doc: dict[str, Any]) -> dict[str, Any]:
+def _summarize_schema(value: Any, *, depth: int = 0, max_depth: int = 2, max_items: int = 8) -> Any:
+    if depth >= max_depth:
+        if isinstance(value, dict):
+            return '{...}'
+        if isinstance(value, list):
+            return ['...']
+        return value
+    if isinstance(value, dict):
+        items = list(value.items())[:max_items]
+        summary = {key: _summarize_schema(item, depth=depth + 1, max_depth=max_depth, max_items=max_items)
+                   for key, item in items}
+        if len(value) > max_items:
+            summary['...'] = f'+{len(value) - max_items} more keys'
+        return summary
+    if isinstance(value, list):
+        if not value:
+            return []
+        summary = [
+            _summarize_schema(item, depth=depth + 1, max_depth=max_depth, max_items=max_items)
+            for item in value[:1]
+        ]
+        if len(value) > 1:
+            summary.append(f'+{len(value) - 1} more items')
+        return summary
+    return value
+
+
+def _summarize_response_schemas(doc: dict[str, Any]) -> dict[str, Any]:
+    schemas = doc.get('response_schemas') or {}
+    if not isinstance(schemas, dict):
+        return {}
+    return {
+        key: _summarize_schema(value)
+        for key, value in list(schemas.items())[:4]
+    }
+
+
+def _detailed_api_doc(doc: dict[str, Any], *, include_response_schemas: bool = True) -> dict[str, Any]:
+    parameters = []
+    for param in doc.get('parameters') or []:
+        if not isinstance(param, dict):
+            continue
+        parameters.append({
+            'name': param.get('name'),
+            'type': param.get('type'),
+            'required': param.get('required'),
+            'description': param.get('description'),
+        })
     return {
         'app_name': doc.get('app_name'),
         'api_name': doc.get('api_name'),
         'method': doc.get('method'),
         'path': doc.get('path'),
         'description': doc.get('description'),
-        'parameters': doc.get('parameters') or [],
-        'response_schemas': doc.get('response_schemas') or {},
+        'parameters': parameters,
+        **(
+            {'response_schemas': _summarize_response_schemas(doc)}
+            if include_response_schemas
+            else {}
+        ),
     }
 
 
@@ -236,7 +287,7 @@ def _rank_api_docs(docs: dict[str, dict[str, Any]], query: str, limit: int) -> l
         if score:
             scored.append((score, doc))
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [_detailed_api_doc(doc) for _, doc in scored[:limit]]
+    return [_compact_api_doc(doc) for _, doc in scored[:limit]]
 
 
 @dataclass
@@ -251,7 +302,7 @@ class AppWorldRuntime:
     timeout_seconds: float | None = None
     max_interactions: int = 200
     max_api_calls_per_interaction: int = 1000
-    show_api_response_schemas: bool = True
+    show_api_response_schemas: bool = False
     initialized: bool = False
     task_info: dict[str, Any] = field(default_factory=dict)
     tool_trace: list[dict[str, Any]] = field(default_factory=list)
@@ -412,7 +463,7 @@ def prepare_appworld_task(
             if str(max_api_calls_per_interaction or '').strip()
             else 1000
         ),
-        show_api_response_schemas=True if show_api_response_schemas is None else bool(show_api_response_schemas),
+        show_api_response_schemas=False if show_api_response_schemas is None else bool(show_api_response_schemas),
     )
     _RUNTIMES[resolved_session_id] = runtime
     task_info = runtime.initialize()
@@ -503,7 +554,10 @@ def appworld_api_docs(
         if api:
             result: Any = {
                 'app_name': app,
-                'api': _detailed_api_doc(docs[api]),
+                'api': _detailed_api_doc(
+                    docs[api],
+                    include_response_schemas=runtime.show_api_response_schemas,
+                ),
             }
         elif raw_api and _normalize_search_text(raw_api) not in {'', 'all', 'any'}:
             matches = _rank_api_docs(docs, raw_api, limit)
@@ -511,18 +565,19 @@ def appworld_api_docs(
                 'app_name': app,
                 'message': f'API {raw_api!r} was not found. Use one of the listed api_name values.',
                 'matches': matches,
-                'available_api_names': sorted(docs.keys()),
+                'available_api_names': sorted(docs.keys())[:50],
             }
         elif raw_query:
             result = {
                 'app_name': app,
                 'matches': _rank_api_docs(docs, raw_query, limit),
+                'message': 'Use api_name to fetch one exact API after narrowing candidates.',
             }
         else:
             result = {
                 'app_name': app,
                 'total_api_count': len(docs),
-                'available_api_names': sorted(docs.keys()),
+                'available_api_names': sorted(docs.keys())[:50],
                 'apis': [_compact_api_doc(doc) for doc in list(docs.values())[:limit]],
                 'message': 'Pass api_name for one full API doc, or query for ranked matches.',
             }
@@ -542,10 +597,10 @@ def appworld_api_docs(
             result = {
                 'query': raw_query,
                 'matches': _rank_api_docs(all_docs, raw_query, limit),
-                'available_apps': apps,
+                'available_apps': apps[:50],
             }
         else:
-            result = {'available_apps': apps}
+            result = {'available_apps': apps[:50]}
 
     output = {'output': result}
     runtime.record_tool_call(

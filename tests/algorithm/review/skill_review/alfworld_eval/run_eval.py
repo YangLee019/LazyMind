@@ -30,8 +30,8 @@ from alfworld_eval.alfworld_tool import ALFWorldTool
 from alfworld_eval.env_loader import SUPPORTED_SPLITS, init_alfworld_env
 
 
-CREATE_USER_ID = '49437df8-55ed-4533-8afe-7efe4950a3b0'
-CREATE_USER_NAME = 'eval'
+CREATE_USER_ID = '6ac87349-0d7e-4a08-b0a4-cb6fe49c4959'
+CREATE_USER_NAME = 'admin'
 MAX_ALFWORLD_STEPS = 50
 
 

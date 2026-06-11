@@ -190,10 +190,17 @@ async def _run_single_handle_chat_task(
             model_config=model_config,
             tool_config=tool_config,
         )
-        final_payloads = [payload async for payload in _iter_payloads(response)]
+        stream_error: Exception | None = None
+        try:
+            async for payload in _iter_payloads(response):
+                final_payloads.append(payload)
+        except Exception as exc:  # noqa: BLE001
+            stream_error = exc
         service_tool_call_turns = _extract_service_tool_call_turns(final_payloads)
         runtime = _extract_runtime(final_payloads)
         error = _extract_error(final_payloads)
+        if error is None and stream_error is not None:
+            error = str(stream_error)
 
         task_status = _safe_call_dict(lambda: tool.status(session_id))
         if not runtime:
@@ -263,6 +270,7 @@ async def _run_single_handle_chat_task(
             tool.cleanup(session_id)
         except Exception as exc:  # noqa: BLE001
             LOG.warning(f'[AppWorldEval] cleanup skipped for session={session_id}: {exc}')
+        _teardown_lazyllm_session(session_id)
 
 
 async def _call_handle_chat(
@@ -316,6 +324,18 @@ def _disabled_tools_except_appworld(configs: list[Any]) -> list[str]:
         if name and name != 'appworld_eval':
             disabled.append(name)
     return disabled
+
+
+def _teardown_lazyllm_session(session_id: str) -> None:
+    try:
+        import lazyllm
+
+        lazyllm.globals._init_sid(sid=session_id)
+        lazyllm.locals._init_sid(sid=session_id)
+        lazyllm.globals.clear()
+        lazyllm.locals.clear()
+    except Exception:  # noqa: BLE001
+        return
 
 
 def _build_task_query(prepare_data: dict[str, Any]) -> str:
