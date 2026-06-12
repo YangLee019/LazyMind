@@ -16,6 +16,7 @@ class ALFWorldTool:
         self.reward: float = 0.0
         self.done: bool = False
         self.info: dict[str, Any] = {}
+        self.gamefile: str | None = None
         self.step_count: int = 0
         self.tool_events: list[dict[str, Any]] = []
 
@@ -26,6 +27,7 @@ class ALFWorldTool:
         self.reward = 0.0
         self.done = False
         self.info = self._first(info, default={})
+        self.gamefile = self._extract_gamefile(self.info)
         self.step_count = 0
         self.tool_events = []
         return {
@@ -50,6 +52,12 @@ class ALFWorldTool:
         self.reward = float(self._first(rewards, default=0.0) or 0.0)
         self.done = bool(self._first(dones, default=False))
         self.info = self._first(infos, default={})
+        next_gamefile = self._extract_gamefile(self.info)
+        if next_gamefile:
+            self.gamefile = next_gamefile
+        elif self.gamefile:
+            self.info = dict(self.info)
+            self.info['extra.gamefile'] = [self.gamefile]
         self.step_count += 1
         event = {
             'step': self.step_count,
@@ -92,3 +100,13 @@ class ALFWorldTool:
         if isinstance(value, (list, tuple)):
             return value[0] if value else default
         return value
+
+    @staticmethod
+    def _extract_gamefile(info: Any) -> str | None:
+        if not isinstance(info, dict):
+            return None
+        value = info.get('extra.gamefile') or info.get('gamefile')
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        text = str(value or '').strip()
+        return text or None

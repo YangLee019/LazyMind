@@ -8,14 +8,19 @@ from pathlib import Path
 
 
 def _bootstrap_repo_imports() -> None:
-    package_parent = Path(__file__).resolve().parent.parent
-    lazyrag_root = package_parent / 'LazyRAG'
+    current = Path(__file__).resolve()
+    package_parent = next(
+        p for p in [current.parent, *current.parents]
+        if p.name == 'LazyRAG' or p.name == 'LazyMind'
+    )
+    lazyrag_root = package_parent
     extra_pythonpath = os.getenv('ALFWORLD_EVAL_EXTRA_PYTHONPATH', '')
     paths = [
         *(Path(path).expanduser() for path in extra_pythonpath.split(':') if path.strip()),
         package_parent,
         lazyrag_root / 'algorithm' / 'lazyllm',
         lazyrag_root / 'algorithm',
+        lazyrag_root / 'tests' / 'algorithm' / 'review' / 'skill_review',
     ]
     for path in reversed(paths):
         text = str(path)
@@ -30,8 +35,8 @@ from alfworld_eval.alfworld_tool import ALFWorldTool
 from alfworld_eval.env_loader import SUPPORTED_SPLITS, init_alfworld_env
 
 
-CREATE_USER_ID = '6ac87349-0d7e-4a08-b0a4-cb6fe49c4959'
-CREATE_USER_NAME = 'admin'
+CREATE_USER_ID = '08251fb2-67a8-4d78-af5c-64042a43f2c3'
+CREATE_USER_NAME = 'eval_skill'
 MAX_ALFWORLD_STEPS = 50
 
 
@@ -69,6 +74,8 @@ def main() -> None:
     )
     parser.add_argument('--seed', type=int, help='Random seed for shuffling ALFWorld tasks before taking num-tasks.')
     parser.add_argument('--max-agent-retries', type=int, default=MAX_ALFWORLD_STEPS)
+    parser.add_argument('--user-id', default=CREATE_USER_ID)
+    parser.add_argument('--user-name', default=CREATE_USER_NAME)
     parser.add_argument(
         '--model-config',
         help='JSON string or JSON/YAML file path passed through to handle_chat(model_config=...).',
@@ -86,8 +93,8 @@ def main() -> None:
         tool=tool,
         num_tasks=args.num_tasks,
         max_steps=args.max_steps,
-        create_user_id=CREATE_USER_ID,
-        create_user_name=CREATE_USER_NAME,
+        create_user_id=args.user_id,
+        create_user_name=args.user_name,
         model_config=_load_model_config(args.model_config),
         persist_history=True,
     )

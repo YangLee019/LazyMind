@@ -4,10 +4,15 @@ import asyncio
 import inspect
 import json
 import logging
+import os
+import shutil
+import tempfile
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator
+from sqlalchemy import text
 
 try:
     from lazyllm import LOG
@@ -15,9 +20,143 @@ except ModuleNotFoundError:
     LOG = logging.getLogger(__name__)
 
 from .appworld_tool import APPWORLD_TOOL_NAMES
-from .history_db import insert_chat_history_row
+from .history_db import ensure_conversation_row, insert_chat_history_row
 from .metrics import MAX_STEP_ERROR, compute_metrics
 from .prompt import APPWORLD_SYSTEM_PROMPT
+try:
+    from ..skill_usage import used_get_skill
+except ImportError:
+    from skill_usage import used_get_skill
+
+
+def _load_available_skill_names(create_user_id: str) -> list[str]:
+    user_id = str(create_user_id or '').strip()
+    if not user_id:
+        return []
+
+    try:
+        from lazymind.review.skill_review.db import _get_app_conn
+
+        with _get_app_conn().connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT category, skill_name
+                    FROM skill_resources
+                    WHERE owner_user_id = :user_id
+                      AND node_type = 'parent'
+                      AND is_enabled = TRUE
+                    ORDER BY category ASC, skill_name ASC, updated_at DESC
+                    """
+                ),
+                {'user_id': user_id},
+            ).mappings().all()
+    except Exception as exc:
+        LOG.warning(f'[AppWorldEval] failed to load skills for user_id={user_id!r}: {exc}')
+        return []
+
+    skill_names: list[str] = []
+    first_category_by_name: dict[str, str] = {}
+    duplicate_categories: dict[str, set[str]] = {}
+    for row in rows:
+        skill_name = str(row.get('skill_name') or '').strip()
+        category = str(row.get('category') or '').strip()
+        if not skill_name:
+            continue
+        previous_category = first_category_by_name.get(skill_name)
+        if previous_category is None:
+            first_category_by_name[skill_name] = category
+            skill_names.append(skill_name)
+            continue
+        if previous_category != category:
+            duplicate_categories.setdefault(skill_name, {previous_category}).add(category)
+
+    if duplicate_categories:
+        collisions = ', '.join(
+            f'{name}({", ".join(sorted(categories))})'
+            for name, categories in sorted(duplicate_categories.items())
+        )
+        LOG.warning(
+            f'[AppWorldEval] duplicate skill names detected for user_id={user_id!r}; '
+            f'using first match per plain name: {collisions}'
+        )
+
+    LOG.info(
+        f'[AppWorldEval] loaded {len(skill_names)} available skills for user_id={user_id!r}: '
+        f'{skill_names}'
+    )
+    return skill_names
+
+
+def _export_skills_to_local_dir(create_user_id: str) -> str | None:
+    user_id = str(create_user_id or '').strip()
+    if not user_id:
+        return None
+
+    try:
+        from lazymind.review.skill_review.db import _get_app_conn
+
+        with _get_app_conn().connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT category, skill_name, node_type, parent_skill_name,
+                           relative_path, content, file_ext, is_enabled
+                    FROM skill_resources
+                    WHERE owner_user_id = :user_id
+                      AND is_enabled = TRUE
+                    ORDER BY category ASC, skill_name ASC, node_type ASC, relative_path ASC
+                    """
+                ),
+                {'user_id': user_id},
+            ).mappings().all()
+    except Exception as exc:
+        LOG.warning(f'[AppWorldEval] failed to export local skills for user_id={user_id!r}: {exc}')
+        return None
+
+    if not rows:
+        return None
+
+    root = Path(tempfile.mkdtemp(prefix='appworld_eval_skills_'))
+    parents_written = 0
+    child_written = 0
+    for row in rows:
+        node_type = str(row.get('node_type') or '').strip()
+        category = str(row.get('category') or '').strip() or 'uncategorized'
+        skill_name = str(row.get('skill_name') or '').strip()
+        if not skill_name:
+            continue
+        skill_dir = root / category / skill_name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+
+        if node_type == 'parent':
+            (skill_dir / 'SKILL.md').write_text(str(row.get('content') or ''), encoding='utf-8')
+            parents_written += 1
+            continue
+
+        rel_path = str(row.get('relative_path') or '').strip().replace('\\', '/')
+        prefix = f'{category}/{str(row.get("parent_skill_name") or skill_name).strip()}/'
+        if rel_path.startswith(prefix):
+            rel_path = rel_path[len(prefix):]
+        rel_path = rel_path.lstrip('/')
+        if not rel_path:
+            ext = str(row.get('file_ext') or 'md').strip().lstrip('.') or 'md'
+            rel_path = f'{skill_name}.{ext}'
+        target = skill_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(row.get('content') or ''), encoding='utf-8')
+        child_written += 1
+
+    if parents_written == 0:
+        shutil.rmtree(root, ignore_errors=True)
+        return None
+
+    print(
+        f'[AppWorldEval] exported local skills for user_id={user_id!r} '
+        f'root={str(root)!r} parents={parents_written} children={child_written}',
+        flush=True,
+    )
+    return str(root)
 
 
 def _build_flat_appworld_tool_group(tool: Any) -> Any:
@@ -96,6 +235,8 @@ async def run_appworld_eval_with_handle_chat(
     persist_history: bool = True,
 ) -> dict[str, Any]:
     """Run AppWorld tasks through chat_service.handle_chat."""
+    from lazymind.config import config as _cfg
+
     planned_task_ids = [str(task_id).strip() for task_id in task_ids if str(task_id).strip()]
     if not planned_task_ids:
         raise ValueError('task_ids must contain at least one AppWorld task id')
@@ -104,28 +245,47 @@ async def run_appworld_eval_with_handle_chat(
 
     results: list[dict[str, Any]] = []
     history_rows: list[dict[str, Any]] = []
-    with register_appworld_tool(tool):
-        for episode_index, task_id in enumerate(planned_task_ids, start=1):
-            result, history_row = await _run_single_handle_chat_task(
-                tool=tool,
-                episode_index=episode_index,
-                task_id=task_id,
-                max_steps=max_steps,
-                session_id=str(uuid.uuid4()),
-                session_prefix=session_prefix,
-                create_user_id=create_user_id,
-                model_config=model_config,
-                tool_config=tool_config,
-            )
-            results.append(result)
-            history_rows.append(history_row)
-            if persist_history:
-                insert_chat_history_row(
-                    history_row,
-                    create_user_id=create_user_id,
-                    create_user_name=create_user_name or create_user_id,
-                )
-                LOG.info('[AppWorldEval] inserted chat history row successfully')
+    available_skills = _load_available_skill_names(create_user_id)
+    local_skill_dir = _export_skills_to_local_dir(create_user_id) if available_skills else None
+    print(
+        f'[AppWorldEval] create_user_id={create_user_id!r} '
+        f'loaded_skills={len(available_skills)} {available_skills} '
+        f'skill_fs_url={local_skill_dir or _cfg["skill_fs_url"]!r}',
+        flush=True,
+    )
+    if not available_skills:
+        LOG.warning(
+            f'[AppWorldEval] no enabled skills found for user_id={create_user_id!r}; '
+            'skill tools will not be enabled for this run.'
+        )
+    try:
+        with _cfg.temp('skill_fs_url', local_skill_dir or _cfg['skill_fs_url']):
+            with register_appworld_tool(tool):
+                for episode_index, task_id in enumerate(planned_task_ids, start=1):
+                    result, history_row = await _run_single_handle_chat_task(
+                        tool=tool,
+                        episode_index=episode_index,
+                        task_id=task_id,
+                        max_steps=max_steps,
+                        session_id=str(uuid.uuid4()),
+                        session_prefix=session_prefix,
+                        create_user_id=create_user_id,
+                        model_config=model_config,
+                        tool_config=tool_config,
+                        available_skills=available_skills,
+                    )
+                    results.append(result)
+                    history_rows.append(history_row)
+                    if persist_history:
+                        insert_chat_history_row(
+                            history_row,
+                            create_user_id=create_user_id,
+                            create_user_name=create_user_name or create_user_id,
+                        )
+                        LOG.info('[AppWorldEval] inserted chat history row successfully')
+    finally:
+        if local_skill_dir:
+            shutil.rmtree(local_skill_dir, ignore_errors=True)
 
     return {
         'results': results,
@@ -161,6 +321,7 @@ async def _run_single_handle_chat_task(
     create_user_id: str,
     model_config: dict[str, Any] | None,
     tool_config: dict[str, str] | None,
+    available_skills: list[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     final_payloads: list[dict[str, Any]] = []
     query = ''
@@ -179,6 +340,16 @@ async def _run_single_handle_chat_task(
         task_info = prepare_data.get('task_info') if isinstance(prepare_data.get('task_info'), dict) else {}
         query = _build_task_query(prepare_data)
         print(f'[AppWorldEval] prepared task={task_id}: {query[:200]}')
+        ensure_conversation_row(
+            session_id,
+            create_user_id=create_user_id,
+            create_user_name=create_user_id,
+            display_name=f'AppWorld task {task_id}',
+            benchmark='appworld',
+            task_id=task_id,
+            created_at=session_started_at,
+            updated_at=session_started_at,
+        )
 
         environment_context = tool.environment_context(task_id=task_id, task_info=task_info)
 
@@ -189,6 +360,7 @@ async def _run_single_handle_chat_task(
             environment_context=environment_context,
             model_config=model_config,
             tool_config=tool_config,
+            available_skills=available_skills,
         )
         stream_error: Exception | None = None
         try:
@@ -222,6 +394,7 @@ async def _run_single_handle_chat_task(
             runtime=runtime,
             error=error,
             service_tool_call_turns=service_tool_call_turns,
+            used_skill=used_get_skill(final_payloads),
         )
         return result, _build_chat_history_row(
             episode_index=episode_index,
@@ -249,6 +422,7 @@ async def _run_single_handle_chat_task(
             runtime=runtime,
             error=error,
             service_tool_call_turns=None,
+            used_skill=used_get_skill(final_payloads),
         )
         return result, _build_chat_history_row(
             episode_index=episode_index,
@@ -281,6 +455,7 @@ async def _call_handle_chat(
     environment_context: dict[str, Any],
     model_config: dict[str, Any] | None,
     tool_config: dict[str, Any] | None,
+    available_skills: list[str],
 ) -> Any:
     from lazymind.chat.service import chat_service
 
@@ -298,7 +473,7 @@ async def _call_handle_chat(
         'priority': None,
         'available_tools': ['appworld_eval'],
         'disabled_tools': _disabled_tools_except_appworld(chat_service.DEFAULT_TOOLS),
-        'available_skills': [],
+        'available_skills': available_skills,
         'memory': None,
         'user_preference': None,
         'use_memory': False,
@@ -558,6 +733,7 @@ def _task_result(
     runtime: dict[str, Any],
     error: str | None,
     service_tool_call_turns: int | None,
+    used_skill: bool,
 ) -> dict[str, Any]:
     evaluation = _extract_evaluation(evaluation_payload, runtime)
     steps = _extract_step_count(task_status, runtime)
@@ -569,6 +745,7 @@ def _task_result(
         'steps': steps,
         'tool_call_rounds': steps,
         'handle_chat_tool_call_turns': service_tool_call_turns,
+        'used_skill': used_skill,
         'completed': completed,
         'evaluation': evaluation,
         'task_status': {key: value for key, value in task_status.items() if key != 'trace'},

@@ -7,6 +7,61 @@ from typing import Any
 from sqlalchemy import text
 
 
+def ensure_conversation_row(
+    conversation_id: str,
+    *,
+    create_user_id: str,
+    create_user_name: str = '',
+    display_name: str = '',
+    created_at: Any = None,
+    updated_at: Any = None,
+) -> str:
+    """Ensure the conversation row exists before handle_chat starts streaming."""
+    from lazymind.review.skill_review.db import _get_app_conn
+
+    raw_conversation_id = str(conversation_id or '').strip()
+    if not raw_conversation_id:
+        raise ValueError('conversation_id is required')
+    normalized_conversation_id = _varchar36_id(raw_conversation_id)
+    user_id = str(create_user_id or '').strip()
+    if not user_id:
+        raise ValueError('create_user_id is required')
+
+    resolved_created_at = updated_at or created_at
+    resolved_updated_at = updated_at or created_at
+    with _get_app_conn().begin() as conn:
+        conn.execute(
+            text(
+                """INSERT INTO conversations
+                       (id, display_name, channel_id, search_config, application_id,
+                        ext, model, models, chat_times, create_user_id,
+                        create_user_name, created_at, updated_at, deleted_at)
+                   VALUES
+                       (:id, :display_name, 'alfworld_eval', CAST(:search_config AS JSON),
+                        '', CAST(:ext AS JSON), '', CAST(:models AS JSON), 1,
+                        :create_user_id, :create_user_name, :created_at, :updated_at, NULL)
+                   ON CONFLICT (id) DO UPDATE SET
+                       display_name = EXCLUDED.display_name,
+                       chat_times = GREATEST(conversations.chat_times, 1),
+                       create_user_id = EXCLUDED.create_user_id,
+                       create_user_name = EXCLUDED.create_user_name,
+                       updated_at = EXCLUDED.updated_at"""
+            ),
+            {
+                'id': normalized_conversation_id,
+                'display_name': str(display_name or 'ALFWorld task'),
+                'search_config': json.dumps({}, ensure_ascii=False),
+                'ext': json.dumps({'benchmark': 'alfworld'}, ensure_ascii=False),
+                'models': json.dumps([], ensure_ascii=False),
+                'create_user_id': user_id,
+                'create_user_name': str(create_user_name or user_id),
+                'created_at': resolved_created_at,
+                'updated_at': resolved_updated_at,
+            },
+        )
+    return normalized_conversation_id
+
+
 def insert_chat_history_row(
     row: dict[str, Any],
     *,
@@ -33,35 +88,15 @@ def insert_chat_history_row(
 
     created_at = row.get('create_time')
     updated_at = row.get('update_time') or created_at
+    ensure_conversation_row(
+        conversation_id,
+        create_user_id=user_id,
+        create_user_name=create_user_name,
+        display_name=f'ALFWorld task {row.get("seq", 1)}',
+        created_at=created_at,
+        updated_at=updated_at,
+    )
     with _get_app_conn().begin() as conn:
-        conn.execute(
-            text(
-                """INSERT INTO conversations
-                       (id, display_name, channel_id, search_config, application_id,
-                        ext, model, models, chat_times, create_user_id,
-                        create_user_name, created_at, updated_at, deleted_at)
-                   VALUES
-                       (:id, :display_name, 'alfworld_eval', CAST(:search_config AS JSON),
-                        '', CAST(:ext AS JSON), '', CAST(:models AS JSON), 1,
-                        :create_user_id, :create_user_name, :created_at, :updated_at, NULL)
-                   ON CONFLICT (id) DO UPDATE SET
-                       chat_times = GREATEST(conversations.chat_times, 1),
-                       create_user_id = EXCLUDED.create_user_id,
-                       create_user_name = EXCLUDED.create_user_name,
-                       updated_at = EXCLUDED.updated_at"""
-            ),
-            {
-                'id': conversation_id,
-                'display_name': f'ALFWorld task {row.get("seq", 1)}',
-                'search_config': json.dumps({}, ensure_ascii=False),
-                'ext': json.dumps({'benchmark': 'alfworld'}, ensure_ascii=False),
-                'models': json.dumps([], ensure_ascii=False),
-                'create_user_id': user_id,
-                'create_user_name': str(create_user_name or user_id),
-                'created_at': created_at,
-                'updated_at': updated_at,
-            },
-        )
         conn.execute(
             text(
                 """INSERT INTO chat_histories

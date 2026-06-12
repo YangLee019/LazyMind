@@ -3,15 +3,155 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import shutil
+import tempfile
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator
-from lazyllm import LOG
 
-from .history_db import insert_chat_history_row
-from .metrics import MAX_STEP_ERROR, compute_metrics
+from lazyllm import LOG
+from sqlalchemy import text
+
+from .history_db import ensure_conversation_row, insert_chat_history_row
+from .metrics import MAX_STEP_ERROR, compute_metrics, extract_gamefile, extract_won, infer_task_type_from_gamefile
 from .prompt import ALFWORLD_SYSTEM_PROMPT
+try:
+    from ..skill_usage import used_get_skill
+except ImportError:
+    from skill_usage import used_get_skill
+
+
+def _load_available_skill_names(create_user_id: str) -> list[str]:
+    user_id = str(create_user_id or '').strip()
+    if not user_id:
+        return []
+
+    try:
+        from lazymind.review.skill_review.db import _get_app_conn
+
+        with _get_app_conn().connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT category, skill_name
+                    FROM skill_resources
+                    WHERE owner_user_id = :user_id
+                      AND node_type = 'parent'
+                      AND is_enabled = TRUE
+                    ORDER BY category ASC, skill_name ASC, updated_at DESC
+                    """
+                ),
+                {'user_id': user_id},
+            ).mappings().all()
+    except Exception as exc:
+        LOG.warning(f'[ALFWorldEval] failed to load skills for user_id={user_id!r}: {exc}')
+        return []
+
+    skill_names: list[str] = []
+    first_category_by_name: dict[str, str] = {}
+    duplicate_categories: dict[str, set[str]] = {}
+    for row in rows:
+        skill_name = str(row.get('skill_name') or '').strip()
+        category = str(row.get('category') or '').strip()
+        if not skill_name:
+            continue
+        previous_category = first_category_by_name.get(skill_name)
+        if previous_category is None:
+            first_category_by_name[skill_name] = category
+            skill_names.append(skill_name)
+            continue
+        if previous_category != category:
+            duplicate_categories.setdefault(skill_name, {previous_category}).add(category)
+
+    if duplicate_categories:
+        collisions = ', '.join(
+            f'{name}({", ".join(sorted(categories))})'
+            for name, categories in sorted(duplicate_categories.items())
+        )
+        LOG.warning(
+            f'[ALFWorldEval] duplicate skill names detected for user_id={user_id!r}; '
+            f'using first match per plain name: {collisions}'
+        )
+
+    LOG.info(
+        f'[ALFWorldEval] loaded {len(skill_names)} available skills for user_id={user_id!r}: '
+        f'{skill_names}'
+    )
+    return skill_names
+
+
+def _export_skills_to_local_dir(create_user_id: str) -> str | None:
+    user_id = str(create_user_id or '').strip()
+    if not user_id:
+        return None
+
+    try:
+        from lazymind.review.skill_review.db import _get_app_conn
+
+        with _get_app_conn().connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT category, skill_name, node_type, parent_skill_name,
+                           relative_path, content, file_ext, is_enabled
+                    FROM skill_resources
+                    WHERE owner_user_id = :user_id
+                      AND is_enabled = TRUE
+                    ORDER BY category ASC, skill_name ASC, node_type ASC, relative_path ASC
+                    """
+                ),
+                {'user_id': user_id},
+            ).mappings().all()
+    except Exception as exc:
+        LOG.warning(f'[ALFWorldEval] failed to export local skills for user_id={user_id!r}: {exc}')
+        return None
+
+    if not rows:
+        return None
+
+    root = Path(tempfile.mkdtemp(prefix='alfworld_eval_skills_'))
+    parents_written = 0
+    child_written = 0
+    for row in rows:
+        node_type = str(row.get('node_type') or '').strip()
+        category = str(row.get('category') or '').strip() or 'uncategorized'
+        skill_name = str(row.get('skill_name') or '').strip()
+        if not skill_name:
+            continue
+        skill_dir = root / category / skill_name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+
+        if node_type == 'parent':
+            skill_md = skill_dir / 'SKILL.md'
+            skill_md.write_text(str(row.get('content') or ''), encoding='utf-8')
+            parents_written += 1
+            continue
+
+        rel_path = str(row.get('relative_path') or '').strip().replace('\\', '/')
+        prefix = f'{category}/{str(row.get("parent_skill_name") or skill_name).strip()}/'
+        if rel_path.startswith(prefix):
+            rel_path = rel_path[len(prefix):]
+        rel_path = rel_path.lstrip('/')
+        if not rel_path:
+            ext = str(row.get('file_ext') or 'md').strip().lstrip('.') or 'md'
+            rel_path = f'{skill_name}.{ext}'
+        target = skill_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(row.get('content') or ''), encoding='utf-8')
+        child_written += 1
+
+    if parents_written == 0:
+        shutil.rmtree(root, ignore_errors=True)
+        return None
+
+    print(
+        f'[ALFWorldEval] exported local skills for user_id={user_id!r} '
+        f'root={str(root)!r} parents={parents_written} children={child_written}',
+        flush=True,
+    )
+    return str(root)
 
 
 def _build_flat_alfworld_tool_group(tool: Any) -> Any:
@@ -94,6 +234,8 @@ async def run_alfworld_eval_with_handle_chat(
     persist_history: bool = True,
 ) -> dict[str, Any]:
     """Run ALFWorld tasks through chat_service.handle_chat."""
+    from lazymind.config import config as _cfg
+
     if num_tasks < 1:
         raise ValueError('num_tasks must be >= 1')
     if max_steps < 1:
@@ -101,27 +243,46 @@ async def run_alfworld_eval_with_handle_chat(
 
     results: list[dict[str, Any]] = []
     history_rows: list[dict[str, Any]] = []
-    with register_alfworld_tool(tool):
-        for task_id in range(num_tasks):
-            result, history_row = await _run_single_handle_chat_task(
-                tool=tool,
-                task_id=task_id,
-                max_steps=max_steps,
-                session_id=str(uuid.uuid4()),
-                session_prefix=session_prefix,
-                create_user_id=create_user_id,
-                model_config=model_config,
-                tool_config=tool_config,
-            )
-            results.append(result)
-            history_rows.append(history_row)
-            if persist_history:
-                insert_chat_history_row(
-                    history_row,
-                    create_user_id=create_user_id,
-                    create_user_name=create_user_name or create_user_id,
-                )
-                LOG.info(f'[ALFWorldEval] inserted chat history row successfully')
+    available_skills = _load_available_skill_names(create_user_id)
+    local_skill_dir = _export_skills_to_local_dir(create_user_id) if available_skills else None
+    print(
+        f'[ALFWorldEval] create_user_id={create_user_id!r} '
+        f'loaded_skills={len(available_skills)} {available_skills} '
+        f'skill_fs_url={local_skill_dir or _cfg["skill_fs_url"]!r}',
+        flush=True,
+    )
+    if not available_skills:
+        LOG.warning(
+            f'[ALFWorldEval] no enabled skills found for user_id={create_user_id!r}; '
+            'skill tools will not be enabled for this run.'
+        )
+    try:
+        with _cfg.temp('skill_fs_url', local_skill_dir or _cfg['skill_fs_url']):
+            with register_alfworld_tool(tool):
+                for task_id in range(num_tasks):
+                    result, history_row = await _run_single_handle_chat_task(
+                        tool=tool,
+                        task_id=task_id,
+                        max_steps=max_steps,
+                        session_id=str(uuid.uuid4()),
+                        session_prefix=session_prefix,
+                        create_user_id=create_user_id,
+                        model_config=model_config,
+                        tool_config=tool_config,
+                        available_skills=available_skills,
+                    )
+                    results.append(result)
+                    history_rows.append(history_row)
+                    if persist_history:
+                        insert_chat_history_row(
+                            history_row,
+                            create_user_id=create_user_id,
+                            create_user_name=create_user_name or create_user_id,
+                        )
+                        LOG.info(f'[ALFWorldEval] inserted chat history row successfully')
+    finally:
+        if local_skill_dir:
+            shutil.rmtree(local_skill_dir, ignore_errors=True)
 
     summary = {
         'results': results,
@@ -157,6 +318,7 @@ async def _run_single_handle_chat_task(
     create_user_id: str,
     model_config: dict[str, Any] | None,
     tool_config: dict[str, str] | None,
+    available_skills: list[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     final_payloads: list[dict[str, Any]] = []
     query = ''
@@ -166,9 +328,16 @@ async def _run_single_handle_chat_task(
         initial = tool.reset()
         print(f'[ALFWorldEval] initial: {initial}')
         query = _build_task_query(str(initial.get('observation') or ''), max_steps)
+        ensure_conversation_row(
+            session_id,
+            create_user_id=create_user_id,
+            create_user_name=create_user_id,
+            display_name=f'ALFWorld task {task_id + 1}',
+            created_at=session_started_at,
+            updated_at=session_started_at,
+        )
 
         from lazymind.chat.service.chat_service import handle_chat
-
         handle_chat_kwargs = {
             'query': query,
             'history': [],
@@ -181,7 +350,7 @@ async def _run_single_handle_chat_task(
             'dataset': None,
             'priority': None,
             'available_tools': ['alfworld'],
-            'available_skills': [],
+            'available_skills': available_skills,
             'memory': None,
             'user_preference': None,
             'use_memory': False,
@@ -199,7 +368,7 @@ async def _run_single_handle_chat_task(
         if error is None and not bool(getattr(tool, 'done', False)) and int(getattr(tool, 'step_count', 0) or 0) >= max_steps:
             error = MAX_STEP_ERROR
 
-        result = _task_result(task_id, tool, error)
+        result = _task_result(task_id, tool, error, used_skill=used_get_skill(final_payloads))
         return result, _build_chat_history_row(
             task_id=task_id,
             session_id=session_id,
@@ -214,7 +383,7 @@ async def _run_single_handle_chat_task(
         error = str(exc)
         if 'max_steps exceeded' in error:
             error = MAX_STEP_ERROR
-        result = _task_result(task_id, tool, error)
+        result = _task_result(task_id, tool, error, used_skill=used_get_skill(final_payloads))
         return result, _build_chat_history_row(
             task_id=task_id,
             session_id=session_id,
@@ -348,13 +517,22 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _task_result(task_id: int, tool: Any, error: str | None) -> dict[str, Any]:
+def _task_result(task_id: int, tool: Any, error: str | None, *, used_skill: bool) -> dict[str, Any]:
     final_reward = float(getattr(tool, 'reward', 0.0) or 0.0)
+    won = extract_won(getattr(tool, 'info', {}))
+    gamefile = extract_gamefile(getattr(tool, 'info', {})) or str(getattr(tool, 'gamefile', '') or '')
+    success = error is None and (
+        won if won is not None else final_reward > 0 or bool(getattr(tool, 'done', False))
+    )
     return {
         'task_id': task_id,
-        'success': error is None and final_reward > 0,
+        'success': success,
         'steps': int(getattr(tool, 'step_count', 0) or 0),
         'final_reward': final_reward,
+        'won': won,
+        'gamefile': gamefile,
+        'task_type': infer_task_type_from_gamefile(gamefile),
         'done': bool(getattr(tool, 'done', False)),
+        'used_skill': used_skill,
         'error': error,
     }

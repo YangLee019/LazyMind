@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from typing import Any, Callable
 
-from .metrics import MAX_STEP_ERROR, compute_metrics
+from .metrics import MAX_STEP_ERROR, compute_metrics, extract_gamefile, extract_won, infer_task_type_from_gamefile
 from .prompt import ALFWORLD_SYSTEM_PROMPT
 
 
@@ -68,7 +68,7 @@ def _run_single_task(agent: Any, tool: Any, task_id: int, max_steps: int) -> dic
                 return _task_result(task_id, False, tool, final_reward, MAX_STEP_ERROR)
 
         final_reward = float(getattr(tool, 'reward', final_reward) or 0.0)
-        return _task_result(task_id, final_reward > 0, tool, final_reward, None)
+        return _task_result(task_id, _infer_success(tool, final_reward), tool, final_reward, None)
     except Exception as exc:
         return _task_result(task_id, False, tool, final_reward, str(exc))
 
@@ -150,11 +150,25 @@ def _task_result(
     final_reward: float,
     error: str | None,
 ) -> dict[str, Any]:
+    won = extract_won(getattr(tool, 'info', {}))
+    gamefile = extract_gamefile(getattr(tool, 'info', {})) or str(getattr(tool, 'gamefile', '') or '')
     return {
         'task_id': task_id,
         'success': bool(success),
         'steps': int(getattr(tool, 'step_count', 0) or 0),
         'final_reward': final_reward,
+        'won': won,
+        'gamefile': gamefile,
+        'task_type': infer_task_type_from_gamefile(gamefile),
         'done': bool(getattr(tool, 'done', False)),
         'error': error,
     }
+
+
+def _infer_success(tool: Any, final_reward: float) -> bool:
+    won = extract_won(getattr(tool, 'info', {}))
+    if won is not None:
+        return won
+    if final_reward > 0:
+        return True
+    return bool(getattr(tool, 'done', False))
