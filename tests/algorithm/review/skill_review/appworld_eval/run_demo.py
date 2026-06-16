@@ -34,6 +34,7 @@ _bootstrap_repo_imports()
 
 from appworld_eval.appworld_tool import AppWorldTool
 from appworld_eval.env_loader import plan_task_ids
+from appworld_eval.workdir import prepare_appworld_work_dir
 
 
 CREATE_USER_ID = 'appworld-5'
@@ -83,6 +84,10 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _resolve_path(value: str) -> str:
+    return str(Path(value).expanduser().resolve())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Run one AppWorld demo task.')
     parser.add_argument(
@@ -90,17 +95,24 @@ def main() -> None:
         default=os.getenv('APPWORLD_EVAL_MODEL_CONFIG', ''),
         help='JSON string or JSON/YAML file path passed through to handle_chat(model_config=...).',
     )
+    parser.add_argument(
+        '--work-dir',
+        default=os.getenv('LAZYMIND_APPWORLD_WORK_DIR', '/tmp/workfile'),
+        help='Directory for AppWorld/LazyMind intermediate files. Defaults to /tmp/workfile.',
+    )
     args = parser.parse_args()
 
-    data_root = _require_env('LAZYMIND_APPWORLD_DATA_ROOT')
+    data_root = _resolve_path(_require_env('LAZYMIND_APPWORLD_DATA_ROOT'))
     task_ids = plan_task_ids(data_root=data_root, dataset='dev', episodes=1)
     tool = AppWorldTool(
-        repo_root=_require_env('LAZYMIND_APPWORLD_REPO_ROOT'),
+        repo_root=_resolve_path(_require_env('LAZYMIND_APPWORLD_REPO_ROOT')),
         data_root=data_root,
         environment_url=_require_env('LAZYMIND_APPWORLD_ENVIRONMENT_URL'),
         apis_url=_require_env('LAZYMIND_APPWORLD_APIS_URL'),
         experiment_name=os.getenv('LAZYMIND_APPWORLD_EXPERIMENT_NAME', 'lazyrag'),
     )
+    work_dir = prepare_appworld_work_dir(args.work_dir)
+    print(f'[AppWorldEval] work_dir={work_dir}', flush=True)
     from appworld_eval.handle_chat_runner import run_appworld_eval_with_handle_chat_sync
 
     summary = run_appworld_eval_with_handle_chat_sync(
@@ -117,4 +129,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-

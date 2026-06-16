@@ -185,6 +185,7 @@ def register_appworld_tool(tool: Any):
 
     original_tools = list(chat_service.DEFAULT_TOOLS)
     original_build_system_prompt = chat_service.build_system_prompt
+    original_check_sensitive_content = chat_service.check_sensitive_content
 
     def build_appworld_system_prompt(active_groups: set[str], **kwargs: Any) -> str:
         prompt = original_build_system_prompt(active_groups, **kwargs)
@@ -215,11 +216,13 @@ def register_appworld_tool(tool: Any):
             tool_group_kwargs['aliases'] = tuple(APPWORLD_TOOL_NAMES)
         chat_service.DEFAULT_TOOLS.append(ToolGroupConfig(**tool_group_kwargs))
     chat_service.build_system_prompt = build_appworld_system_prompt
+    chat_service.check_sensitive_content = lambda query: None
     try:
         yield
     finally:
         chat_service.DEFAULT_TOOLS[:] = original_tools
         chat_service.build_system_prompt = original_build_system_prompt
+        chat_service.check_sensitive_content = original_check_sensitive_content
 
 
 async def run_appworld_eval_with_handle_chat(
@@ -262,27 +265,44 @@ async def run_appworld_eval_with_handle_chat(
         with _cfg.temp('skill_fs_url', local_skill_dir or _cfg['skill_fs_url']):
             with register_appworld_tool(tool):
                 for episode_index, task_id in enumerate(planned_task_ids, start=1):
-                    result, history_row = await _run_single_handle_chat_task(
-                        tool=tool,
-                        episode_index=episode_index,
-                        task_id=task_id,
-                        max_steps=max_steps,
-                        session_id=str(uuid.uuid4()),
-                        session_prefix=session_prefix,
-                        create_user_id=create_user_id,
-                        model_config=model_config,
-                        tool_config=tool_config,
-                        available_skills=available_skills,
-                    )
+                    session_id = str(uuid.uuid4())
+                    try:
+                        result, history_row = await _run_single_handle_chat_task(
+                            tool=tool,
+                            episode_index=episode_index,
+                            task_id=task_id,
+                            max_steps=max_steps,
+                            session_id=session_id,
+                            session_prefix=session_prefix,
+                            create_user_id=create_user_id,
+                            model_config=model_config,
+                            tool_config=tool_config,
+                            available_skills=available_skills,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.exception(f'[AppWorldEval] failed episode={episode_index} task_id={task_id}')
+                        result, history_row = _build_unhandled_error_task(
+                            episode_index=episode_index,
+                            task_id=task_id,
+                            session_id=session_id,
+                            session_prefix=session_prefix,
+                            error=str(exc),
+                        )
                     results.append(result)
                     history_rows.append(history_row)
                     if persist_history:
-                        insert_chat_history_row(
-                            history_row,
-                            create_user_id=create_user_id,
-                            create_user_name=create_user_name or create_user_id,
-                        )
-                        LOG.info('[AppWorldEval] inserted chat history row successfully')
+                        try:
+                            insert_chat_history_row(
+                                history_row,
+                                create_user_id=create_user_id,
+                                create_user_name=create_user_name or create_user_id,
+                            )
+                            LOG.info('[AppWorldEval] inserted chat history row successfully')
+                        except Exception:  # noqa: BLE001
+                            LOG.exception(
+                                f'[AppWorldEval] failed to persist chat history '
+                                f'episode={episode_index} task_id={task_id}; continuing'
+                            )
     finally:
         if local_skill_dir:
             shutil.rmtree(local_skill_dir, ignore_errors=True)
@@ -521,6 +541,45 @@ def _build_task_query(prepare_data: dict[str, Any]) -> str:
     return 'Use appworld_task_info() to inspect the prepared AppWorld task, then complete it.'
 
 
+def _build_unhandled_error_task(
+    *,
+    episode_index: int,
+    task_id: str,
+    session_id: str,
+    session_prefix: str,
+    error: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    query = f'AppWorld task {task_id} failed before the task instruction could be recorded.'
+    result = {
+        'episode_index': episode_index,
+        'task_id': task_id,
+        'success': False,
+        'steps': 0,
+        'tool_call_rounds': 0,
+        'handle_chat_tool_call_turns': None,
+        'used_skill': False,
+        'completed': False,
+        'evaluation': {},
+        'task_status': {},
+        'error': error,
+    }
+    history_row = _build_chat_history_row(
+        episode_index=episode_index,
+        task_id=task_id,
+        session_id=session_id,
+        query=query,
+        payloads=[],
+        result=result,
+        prepare_data={},
+        task_status={},
+        evaluation_payload={},
+        runtime={},
+        create_time=_utc_now_iso(),
+        session_prefix=session_prefix,
+    )
+    return result, history_row
+
+
 async def _iter_payloads(response: Any) -> AsyncIterator[dict[str, Any]]:
     if isinstance(response, dict):
         yield response
@@ -528,20 +587,45 @@ async def _iter_payloads(response: Any) -> AsyncIterator[dict[str, Any]]:
     body_iterator = getattr(response, 'body_iterator', None)
     if body_iterator is None:
         return
+    buffer = ''
     async for chunk in body_iterator:
         text = chunk.decode('utf-8') if isinstance(chunk, bytes) else str(chunk)
-        for block in text.strip().split('\n\n'):
-            line = block.strip()
-            if not line:
-                continue
-            if line.startswith('data:'):
-                line = line.removeprefix('data:').strip()
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
+        buffer += text
+        while '\n\n' in buffer:
+            block, buffer = buffer.split('\n\n', 1)
+            payload = _parse_sse_payload_block(block)
+            if payload is not None:
                 yield payload
+    payload = _parse_sse_payload_block(buffer)
+    if payload is not None:
+        yield payload
+
+
+def _parse_sse_payload_block(block: str) -> dict[str, Any] | None:
+    data_lines: list[str] = []
+    raw_json_lines: list[str] = []
+    for raw_line in str(block or '').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(':'):
+            continue
+        if line.startswith('data:'):
+            data_lines.append(line.removeprefix('data:').strip())
+        else:
+            raw_json_lines.append(line)
+    if data_lines:
+        line = '\n'.join(data_lines).strip()
+    elif raw_json_lines:
+        line = '\n'.join(raw_json_lines).strip()
+    else:
+        return None
+    if not line:
+        return None
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        LOG.warning(f'[AppWorldEval] dropped malformed SSE block: {line[:500]!r}')
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _extract_error(payloads: list[dict[str, Any]]) -> str | None:
@@ -657,6 +741,8 @@ def _build_chat_history_row(
     session_prefix: str,
 ) -> dict[str, Any]:
     text, reasoning_content, sources = _collect_stream_parts(payloads)
+    if not text and result.get('error'):
+        text = f"[AppWorldEval] task failed: {result.get('error')}"
     update_time = _utc_now_iso()
     ext = {
         'benchmark': 'appworld',

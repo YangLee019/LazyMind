@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import textwrap
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,34 @@ import requests
 
 _RUNTIMES: dict[str, AppWorldRuntime] = {}
 _APP_DOCS_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    raw = str(os.getenv(name, '')).strip()
+    if not raw:
+        return max(minimum, default)
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return max(minimum, default)
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    raw = str(os.getenv(name, '')).strip()
+    if not raw:
+        return max(minimum, default)
+    try:
+        return max(minimum, float(raw))
+    except ValueError:
+        return max(minimum, default)
+
+
+_TOOL_OUTPUT_MAX_CHARS = _env_int('LAZYMIND_APPWORLD_TOOL_OUTPUT_MAX_CHARS', 3000, minimum=1000)
+_TRACE_OUTPUT_MAX_CHARS = _env_int('LAZYMIND_APPWORLD_TRACE_OUTPUT_MAX_CHARS', 800, minimum=200)
+_TRACE_MAX_EVENTS = _env_int('LAZYMIND_APPWORLD_TRACE_MAX_EVENTS', 12, minimum=1)
+_HTTP_RETRIES = _env_int('LAZYMIND_APPWORLD_HTTP_RETRIES', 2, minimum=1)
+_HTTP_RETRY_DELAY_SECONDS = 0.25
+_DEFAULT_TIMEOUT_SECONDS = _env_float('LAZYMIND_APPWORLD_TIMEOUT_SECONDS', 120.0, minimum=1.0)
 
 
 def _current_session_id() -> str:
@@ -62,15 +91,50 @@ def _normalize_url(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)).rstrip('/')
 
 
-def _json_post(url: str, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+def _json_post(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float | None = None,
+    *,
+    retries: int = 1,
+) -> dict[str, Any]:
+    last_exc: Exception | None = None
+    attempts = max(1, int(retries or 1))
+    for attempt in range(attempts):
+        try:
+            response = requests.post(url, json=payload, timeout=timeout)
+            response.raise_for_status()
+            value = response.json()
+            return value if isinstance(value, dict) else {'output': value}
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= attempts - 1:
+                break
+            time.sleep(_HTTP_RETRY_DELAY_SECONDS * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _json_get(url: str, timeout: float | None = None, *, retries: int = 1) -> dict[str, Any]:
+    last_exc: Exception | None = None
+    attempts = max(1, int(retries or 1))
+    for attempt in range(attempts):
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            value = response.json()
+            return value if isinstance(value, dict) else {'output': value}
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= attempts - 1:
+                break
+            time.sleep(_HTTP_RETRY_DELAY_SECONDS * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _json_post_once(url: str, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
     response = requests.post(url, json=payload, timeout=timeout)
-    response.raise_for_status()
-    value = response.json()
-    return value if isinstance(value, dict) else {'output': value}
-
-
-def _json_get(url: str, timeout: float | None = None) -> dict[str, Any]:
-    response = requests.get(url, timeout=timeout)
     response.raise_for_status()
     value = response.json()
     return value if isinstance(value, dict) else {'output': value}
@@ -79,6 +143,83 @@ def _json_get(url: str, timeout: float | None = None) -> dict[str, Any]:
 def _shorten(value: Any, limit: int = 1000) -> str:
     text = str(value)
     return text if len(text) <= limit else text[:limit] + '...'
+
+
+def _truncate_text(value: Any, limit: int, *, label: str = 'output') -> str:
+    text = str(value or '')
+    if len(text) <= limit:
+        return text
+    head_len = max(1, limit // 2)
+    tail_len = max(1, limit - head_len)
+    omitted = len(text) - head_len - tail_len
+    return (
+        f'{text[:head_len]}\n'
+        f'...[{label} truncated: omitted {omitted} chars; print smaller summaries, counts, '
+        f'filtered records, or paginated slices instead of full datasets]...\n'
+        f'{text[-tail_len:]}'
+    )
+
+
+def _compact_trace_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    recent = events[-_TRACE_MAX_EVENTS:]
+    compact: list[dict[str, Any]] = []
+    skipped = len(events) - len(recent)
+    if skipped > 0:
+        compact.append({'event': 'trace_truncated', 'omitted_event_count': skipped})
+    for item in recent:
+        if not isinstance(item, dict):
+            continue
+        compact_item = copy.deepcopy(item)
+        if 'input' in compact_item:
+            compact_item['input'] = _truncate_text(compact_item.get('input'), 500, label='input')
+        if 'output' in compact_item:
+            compact_item['output'] = _truncate_text(
+                compact_item.get('output'),
+                _TRACE_OUTPUT_MAX_CHARS,
+                label='trace output',
+            )
+        result = compact_item.get('result')
+        if isinstance(result, dict) and 'output' in result:
+            result['output'] = _truncate_text(
+                result.get('output'),
+                _TRACE_OUTPUT_MAX_CHARS,
+                label='trace result',
+            )
+        compact.append(compact_item)
+    return compact
+
+
+def _compact_result_for_trace(result: Any) -> Any:
+    if not isinstance(result, dict):
+        return _truncate_text(result, _TRACE_OUTPUT_MAX_CHARS, label='trace result')
+    compact = copy.deepcopy(result)
+    if 'trace' in compact:
+        compact['trace'] = {'omitted': True}
+    task_info = compact.get('task_info')
+    if isinstance(task_info, dict):
+        compact['task_info'] = {
+            key: task_info.get(key)
+            for key in ('instruction', 'datetime')
+            if key in task_info
+        }
+    output = compact.get('output')
+    if isinstance(output, str):
+        compact['output'] = _truncate_text(output, _TRACE_OUTPUT_MAX_CHARS, label='trace result')
+    elif isinstance(output, dict):
+        encoded = json.dumps(output, ensure_ascii=False, default=str)
+        if len(encoded) > _TRACE_OUTPUT_MAX_CHARS:
+            compact['output'] = _truncate_text(encoded, _TRACE_OUTPUT_MAX_CHARS, label='trace result')
+    return compact
+
+
+def _coerce_timeout_seconds(timeout_seconds: float | str | None) -> float:
+    raw = str(timeout_seconds or '').strip()
+    if not raw:
+        return _DEFAULT_TIMEOUT_SECONDS
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return _DEFAULT_TIMEOUT_SECONDS
 
 
 def _execution_succeeded(output: str) -> bool:
@@ -324,7 +465,12 @@ class AppWorldRuntime:
             'timeout_seconds': self.timeout_seconds,
             'show_api_response_schemas': self.show_api_response_schemas,
         }
-        response = _json_post(f'{self.environment_url}/initialize', payload, self.timeout_seconds)
+        response = _json_post(
+            f'{self.environment_url}/initialize',
+            payload,
+            self.timeout_seconds,
+            retries=_HTTP_RETRIES,
+        )
         output = response.get('output')
         self.task_info = output if isinstance(output, dict) else {}
         if not self.task_info:
@@ -337,12 +483,12 @@ class AppWorldRuntime:
         if self.interaction_count >= self.max_interactions:
             raise RuntimeError('max_interactions exceeded')
         rewritten = _rewrite_appworld_code(code)
-        response = _json_post(
+        response = _json_post_once(
             f'{self.environment_url}/execute',
             {'task_id': self.task_id, 'code': rewritten},
             self.timeout_seconds,
         )
-        output = str(response.get('output') or '')
+        output = _truncate_text(response.get('output'), _TOOL_OUTPUT_MAX_CHARS)
         self.interaction_count += 1
         self.last_output = output
         self.environment_trace.append({
@@ -358,10 +504,11 @@ class AppWorldRuntime:
                 f'{self.environment_url}/task_completed',
                 {'task_id': self.task_id},
                 self.timeout_seconds,
+                retries=_HTTP_RETRIES,
             )
             self.completed = bool(response.get('output'))
         except Exception:  # noqa: BLE001
-            self.completed = False
+            pass
         return self.completed
 
     def evaluate(self) -> dict[str, Any]:
@@ -369,6 +516,7 @@ class AppWorldRuntime:
             f'{self.environment_url}/evaluate',
             {'task_id': self.task_id, 'suppress_errors': True, 'report': False},
             self.timeout_seconds,
+            retries=_HTTP_RETRIES,
         )
         output = response.get('output')
         self.evaluation = output if isinstance(output, dict) else {}
@@ -378,7 +526,12 @@ class AppWorldRuntime:
         if not self.initialized:
             return
         try:
-            _json_post(f'{self.environment_url}/close', {'task_id': self.task_id}, self.timeout_seconds)
+            _json_post(
+                f'{self.environment_url}/close',
+                {'task_id': self.task_id},
+                self.timeout_seconds,
+                retries=_HTTP_RETRIES,
+            )
         finally:
             self.initialized = False
 
@@ -396,8 +549,8 @@ class AppWorldRuntime:
 
     def runtime_trace(self) -> dict[str, Any]:
         return {
-            'tool_trace': copy.deepcopy(self.tool_trace),
-            'environment_trace': copy.deepcopy(self.environment_trace),
+            'tool_trace': _compact_trace_events(self.tool_trace),
+            'environment_trace': _compact_trace_events(self.environment_trace),
             'environment_final': {
                 'status': {
                     'interaction_count': self.interaction_count,
@@ -412,7 +565,7 @@ class AppWorldRuntime:
         self.tool_trace.append({
             'tool_name': tool_name,
             'arguments': copy.deepcopy(args),
-            'result': copy.deepcopy(result),
+            'result': _compact_result_for_trace(result),
         })
 
 
@@ -456,7 +609,7 @@ def prepare_appworld_task(
         environment_url=_normalize_url(environment_url),
         apis_url=_normalize_url(apis_url),
         experiment_name=str(experiment_name or 'lazyrag').strip(),
-        timeout_seconds=float(timeout_seconds) if str(timeout_seconds or '').strip() else None,
+        timeout_seconds=_coerce_timeout_seconds(timeout_seconds),
         max_interactions=int(max_interactions) if str(max_interactions or '').strip() else 200,
         max_api_calls_per_interaction=(
             int(max_api_calls_per_interaction)

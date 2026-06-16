@@ -74,8 +74,8 @@ def main() -> None:
     )
     parser.add_argument('--seed', type=int, help='Random seed for shuffling ALFWorld tasks before taking num-tasks.')
     parser.add_argument('--max-agent-retries', type=int, default=MAX_ALFWORLD_STEPS)
-    parser.add_argument('--user-id', default=CREATE_USER_ID)
-    parser.add_argument('--user-name', default=CREATE_USER_NAME)
+    parser.add_argument('--user-id', '--userid', dest='user_id', default=CREATE_USER_ID)
+    parser.add_argument('--user-name', '--username', dest='user_name', default=CREATE_USER_NAME)
     parser.add_argument(
         '--model-config',
         help='JSON string or JSON/YAML file path passed through to handle_chat(model_config=...).',

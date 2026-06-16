@@ -39,15 +39,20 @@ appworld verify tasks --root /path/to/appworld/root
 
 ```bash
 # terminal 1
+mkdir -p /tmp/workfile
+cd /tmp/workfile
 appworld serve environment --port 18000 --root /path/to/appworld/root
 ```
 
 ```bash
 # terminal 2
+mkdir -p /tmp/workfile
+cd /tmp/workfile
 appworld serve apis --port 19000 --root /path/to/appworld/root
 ```
 
 启动后确认 `appworld_env.sh` 中的 `LAZYMIND_APPWORLD_ENVIRONMENT_URL` 和 `LAZYMIND_APPWORLD_APIS_URL` 指向这两个服务。评测脚本不会自动拉起 AppWorld 服务。
+AppWorld 的部分 SQLite memory URI 会按服务进程当前目录产生 `task_output-*` 等中间目录，因此服务进程也建议从 `/tmp/workfile` 启动。
 
 常用配置项如下：
 
@@ -64,6 +69,7 @@ LAZYMIND_APPWORLD_DATA_ROOT=/path/to/appworld/root
 LAZYMIND_APPWORLD_REPO_ROOT=/path/to/appworld
 LAZYMIND_APPWORLD_ENVIRONMENT_URL=http://127.0.0.1:18000
 LAZYMIND_APPWORLD_APIS_URL=http://127.0.0.1:19000
+LAZYMIND_APPWORLD_WORK_DIR=/tmp/workfile
 LAZYMIND_CORE_DATABASE_URL=postgresql+psycopg://root:123456@localhost:5432/core
 APPWORLD_EVAL_EXTRA_PYTHONPATH=
 ```
@@ -165,6 +171,7 @@ python tests/algorithm/review/skill_review/appworld_eval/run_eval.py \
 - `--repo-root`: AppWorld 源码仓库根目录
 - `--environment-url`: AppWorld environment 服务地址
 - `--apis-url`: AppWorld APIs 服务地址
+- `--work-dir`: AppWorld/LazyMind 中间文件目录，默认 `/tmp/workfile`
 - `--seed`: 从 dataset 中随机抽取任务时使用的随机种子；不传则按文件顺序取前 N 个
 - `--model-config`: JSON 字符串或 JSON/YAML 文件，透传给 `handle_chat(model_config=...)`
 - `--no-persist-history`: 只跑评测，不写 `chat_histories`
