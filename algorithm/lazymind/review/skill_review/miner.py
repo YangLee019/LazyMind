@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from concurrent.futures import as_completed
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,10 @@ from lazymind.review.skill_review.schemas import (
 from lazymind.review.skill_review.json_call import call_json
 from lazymind.review.skill_review.reports import finish_stage_report, stage_error, start_stage, write_json_file
 from lazymind.review.skill_review.prompt import candidate_prompt, outline_prompt
+
+
+_SKILL_NAME_PATTERN = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
+_SKILL_NAME_MAX_LENGTH = 64
 
 
 _OUTLINE_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -239,24 +244,109 @@ def _normalize_candidate_payload(
     source_trajectories: list[str],
     source_skills: dict[str, str],
 ) -> dict[str, Any]:
-    skill_name = str(payload.get('skill_name') or '').strip()
+    raw_skill_name = str(payload.get('skill_name') or outline.skill_name or '').strip()
     applicable_scenario = str(payload.get('applicable_scenario') or '').strip()
     content = str(payload.get('content') or '').strip()
-    if not skill_name:
-        raise ValueError('candidate payload must contain skill_name')
     if not applicable_scenario:
         raise ValueError('candidate payload must contain applicable_scenario')
     if not content:
         raise ValueError('candidate payload must contain content')
+    skill_name = _repair_skill_name(raw_skill_name, fallback=outline.skill_name or 'skill')
+    if skill_name != raw_skill_name:
+        LOG.warning(f'repaired candidate skill_name: {raw_skill_name!r} -> {skill_name!r}')
+    content = _repair_candidate_skill_content(content, skill_name)
+    repaired_outline = outline.model_copy(update={'skill_name': skill_name})
     return {
         'skill_name': skill_name,
         'category': str(payload.get('category') or 'general'),
         'source_trajectories': source_trajectories,
         'source_skills': source_skills,
         'applicable_scenario': applicable_scenario,
-        'content': content + '\n',
-        'outline': outline.model_dump(),
+        'content': content,
+        'outline': repaired_outline.model_dump(),
     }
+
+
+def _repair_skill_name(raw_name: str, *, fallback: str = 'skill') -> str:
+    source = str(raw_name or fallback or 'skill').strip().lower()
+    slug = re.sub(r'[^a-z0-9]+', '-', source)
+    slug = re.sub(r'-+', '-', slug).strip('-')
+    if not slug:
+        slug = 'skill'
+    if len(slug) > _SKILL_NAME_MAX_LENGTH:
+        slug = slug[:_SKILL_NAME_MAX_LENGTH].rstrip('-')
+    slug = slug or 'skill'
+    if not _SKILL_NAME_PATTERN.fullmatch(slug):
+        raise ValueError(f'failed to repair skill_name from {raw_name!r}')
+    return slug
+
+
+def _repair_candidate_skill_content(content: str, skill_name: str) -> str:
+    lines = content.lstrip('\ufeff').splitlines()
+    if not lines or lines[0].strip() != '---':
+        raise ValueError('candidate content must start with YAML frontmatter')
+
+    frontmatter_end = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == '---':
+            frontmatter_end = index
+            break
+    if frontmatter_end is None:
+        raise ValueError('candidate content must close YAML frontmatter')
+
+    frontmatter_lines = lines[1:frontmatter_end]
+    frontmatter = _parse_frontmatter_lines(frontmatter_lines)
+    description = str(frontmatter.get('description') or '').strip()
+    if not description:
+        raise ValueError('candidate content frontmatter must contain description')
+
+    repaired_frontmatter, changed = _repair_frontmatter_name(frontmatter_lines, skill_name)
+    if changed:
+        LOG.warning(f'repaired candidate content frontmatter name to {skill_name!r}')
+    repaired = ['---', *repaired_frontmatter, '---', *lines[frontmatter_end + 1:]]
+    return '\n'.join(repaired).strip() + '\n'
+
+
+def _parse_frontmatter_lines(frontmatter_lines: list[str]) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in frontmatter_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#') or ':' not in stripped:
+            continue
+        key, value = stripped.split(':', 1)
+        key = key.strip()
+        if key:
+            fields[key] = _strip_yaml_scalar(value.strip())
+    return fields
+
+
+def _strip_yaml_scalar(value: str) -> str:
+    value = re.sub(r'\s+#.*$', '', value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1].strip()
+    return value
+
+
+def _repair_frontmatter_name(frontmatter_lines: list[str], skill_name: str) -> tuple[list[str], bool]:
+    repaired: list[str] = []
+    changed = False
+    found = False
+    for line in frontmatter_lines:
+        stripped = line.strip()
+        key = stripped.split(':', 1)[0].strip() if ':' in stripped else ''
+        if key == 'name':
+            found = True
+            indent = line[:len(line) - len(line.lstrip())]
+            new_line = f'{indent}name: {skill_name}'
+            repaired.append(new_line)
+            if line != new_line:
+                changed = True
+        else:
+            repaired.append(line)
+    if not found:
+        repaired.insert(0, f'name: {skill_name}')
+        changed = True
+    return repaired, changed
 
 
 def _collect_source_trajectories(cluster: TaskCluster) -> list[str]:
