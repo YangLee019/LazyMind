@@ -75,23 +75,23 @@ async def handle_chat(query: str, history: Optional[List[Dict[str, Any]]],
     )
     start_time = time.time()
     priority = priority or LAZYMIND_LLM_PRIORITY
-    sensitive_word = check_sensitive_content(query)
-    if sensitive_word:
-        cost = round(time.time() - start_time, 3)
-        LOG.warning(
-            f'[ChatServer] [SENSITIVE_FILTER_BLOCKED] [query={query[:50]}...] '
-            f'[sensitive_word={sensitive_word}] [session_id={session_id}]'
-        )
-        return single_event_stream_response(response_payload(
-            200,
-            'success',
-            {
-                'think': None,
-                'text': SENSITIVE_FILTER_RESPONSE_TEXT,
-                'sources': [],
-            },
-            cost,
-        ), final_data={'tool_call_turns': 0})
+    # sensitive_word = check_sensitive_content(query)
+    # if sensitive_word:
+    #     cost = round(time.time() - start_time, 3)
+    #     LOG.warning(
+    #         f'[ChatServer] [SENSITIVE_FILTER_BLOCKED] [query={query[:50]}...] '
+    #         f'[sensitive_word={sensitive_word}] [session_id={session_id}]'
+    #     )
+    #     return single_event_stream_response(response_payload(
+    #         200,
+    #         'success',
+    #         {
+    #             'think': None,
+    #             'text': SENSITIVE_FILTER_RESPONSE_TEXT,
+    #             'sources': [],
+    #         },
+    #         cost,
+    #     ), final_data={'tool_call_turns': 0})
 
     filters = dict(filters or {})
     resolved_files = validate_and_resolve_files(files)
