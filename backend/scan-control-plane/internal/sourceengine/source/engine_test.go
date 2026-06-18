@@ -93,6 +93,174 @@ func TestCreateSourcePersistsTargetsInBindingsOnly(t *testing.T) {
 	}
 }
 
+func TestCreateSourceQueuesLocalWatcherStartForManualBinding(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	local := &sourceSpyConnector{
+		connectorType: connector.ConnectorType(localFSConnectorType),
+		targetType:    connector.TargetType(localFSTargetType),
+		target: connector.NormalizedTarget{
+			TargetType:        connector.TargetType(localFSTargetType),
+			TargetRef:         "/workspace/docs",
+			TargetFingerprint: "local_fs:agent-1:/workspace/docs",
+			DisplayName:       "docs",
+			ProviderMeta:      connector.ProviderMeta{"agent_id": "agent-1"},
+			RootObjectKey:     "local_fs:agent-1:path:/workspace/docs",
+		},
+	}
+	engine := newTestSourceEngine(t, repo, &sourceCoreSpy{}, local, now)
+
+	resp, err := engine.CreateSource(context.Background(), CreateSourceRequest{
+		CallerID:  "user-1",
+		TenantID:  "tenant-1",
+		RequestID: "request-1",
+		Name:      "Local Docs",
+		Bindings: []BindingInput{{
+			ConnectorType: connector.ConnectorType(localFSConnectorType),
+			TargetType:    connector.TargetType(localFSTargetType),
+			TargetRef:     "/workspace/docs",
+			SyncMode:      SyncModeManual,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	if len(repo.agentCommands) != 1 {
+		t.Fatalf("expected one local watcher command, got %+v", repo.agentCommands)
+	}
+	command := repo.agentCommands[0]
+	if _, err := strconv.ParseInt(command.CommandID, 10, 64); err != nil {
+		t.Fatalf("agent command id must be numeric for file-watcher ack, got %q", command.CommandID)
+	}
+	if command.AgentID != "agent-1" || command.CommandType != agentCommandStartSource {
+		t.Fatalf("unexpected watcher command identity: %+v", command)
+	}
+	if command.Payload["type"] != agentCommandStartSource || command.Payload[agentCommandRootPathKey] != "/workspace/docs" || command.Payload["skip_initial_scan"] != true {
+		t.Fatalf("start_source payload does not match file-watcher contract: %+v", command.Payload)
+	}
+	if command.Payload["source_id"] != resp.Source.SourceID || command.Payload["tenant_id"] != "tenant-1" {
+		t.Fatalf("start_source payload lost source identity: %+v", command.Payload)
+	}
+}
+
+func TestCreateSourceAllowsEmptyTenant(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	core := &sourceCoreSpy{}
+	spy := &sourceSpyConnector{
+		target: connector.NormalizedTarget{
+			TargetType:        spyTargetType,
+			TargetRef:         "normalized-target",
+			TargetFingerprint: "fingerprint-from-validate",
+			DisplayName:       "Validated Target",
+			RootObjectKey:     "validated-root",
+		},
+	}
+	engine := newTestSourceEngine(t, repo, core, spy, now)
+
+	_, err := engine.CreateSource(context.Background(), CreateSourceRequest{
+		CallerID:  "user-1",
+		RequestID: "request-1",
+		Name:      "Docs",
+		Bindings: []BindingInput{{
+			ConnectorType: spyConnectorType,
+			TargetType:    spyTargetType,
+			TargetRef:     "raw-target",
+			SyncMode:      SyncModeManual,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	if got := repo.createRecords[0].Source.TenantID; got != "" {
+		t.Fatalf("expected empty tenant to be preserved, got %q", got)
+	}
+}
+
+func TestCreateSourceUsesSourceNameForSingleFileBindingRoot(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	core := &sourceCoreSpy{}
+	spy := &sourceSpyConnector{
+		target: connector.NormalizedTarget{
+			TargetType:        spyTargetType,
+			TargetRef:         "wiki:space-1:node-pdf",
+			TargetFingerprint: "feishu:wiki:space-1:node-pdf",
+			DisplayName:       "ALCOHOLDINGS.pdf",
+			ProviderMeta:      connector.ProviderMeta{"kind": "wiki_node", "file_type": "file"},
+			RootObjectKey:     "feishu:wiki:space-1:node-pdf",
+		},
+	}
+	engine := newTestSourceEngine(t, repo, core, spy, now)
+
+	resp, err := engine.CreateSource(context.Background(), CreateSourceRequest{
+		CallerID:  "user-1",
+		TenantID:  "tenant-1",
+		RequestID: "request-1",
+		Name:      "132",
+		Bindings: []BindingInput{{
+			ConnectorType: spyConnectorType,
+			TargetType:    spyTargetType,
+			TargetRef:     "wiki:space-1:node-pdf",
+			SyncMode:      SyncModeManual,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	if len(core.folderRequests) != 1 || core.folderRequests[0].Name != "132" {
+		t.Fatalf("single-file binding root should use source name, got %+v", core.folderRequests)
+	}
+	if len(resp.Bindings) != 1 || resp.Bindings[0].CoreParentDocumentName != "132" {
+		t.Fatalf("binding should keep the core parent name, got %+v", resp.Bindings)
+	}
+}
+
+func TestCreateSourceKeepsExplicitSingleFileBindingRootName(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	core := &sourceCoreSpy{}
+	spy := &sourceSpyConnector{
+		target: connector.NormalizedTarget{
+			TargetType:        spyTargetType,
+			TargetRef:         "wiki:space-1:node-pdf",
+			TargetFingerprint: "feishu:wiki:space-1:node-pdf",
+			DisplayName:       "ALCOHOLDINGS.pdf",
+			ProviderMeta:      connector.ProviderMeta{"kind": "wiki_node", "file_type": "file"},
+			RootObjectKey:     "feishu:wiki:space-1:node-pdf",
+		},
+	}
+	engine := newTestSourceEngine(t, repo, core, spy, now)
+
+	_, err := engine.CreateSource(context.Background(), CreateSourceRequest{
+		CallerID:  "user-1",
+		TenantID:  "tenant-1",
+		RequestID: "request-1",
+		Name:      "132",
+		Bindings: []BindingInput{{
+			ConnectorType: spyConnectorType,
+			TargetType:    spyTargetType,
+			TargetRef:     "wiki:space-1:node-pdf",
+			DisplayName:   "Reports",
+			SyncMode:      SyncModeManual,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	if len(core.folderRequests) != 1 || core.folderRequests[0].Name != "Reports" {
+		t.Fatalf("explicit binding root name should be kept, got %+v", core.folderRequests)
+	}
+}
+
 func TestCreateSourcePreservesStructuredProviderOptions(t *testing.T) {
 	t.Parallel()
 
@@ -264,6 +432,48 @@ func TestTriggerSourceSyncSplitsGenerateScopes(t *testing.T) {
 	}
 }
 
+func TestTriggerSourceSyncConvertsIndexedContainerObjectKeyToSubtree(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	repo.sources["source-1"] = store.Source{SourceID: "source-1", Status: SourceStatusActive, CreatedAt: now, UpdatedAt: now}
+	repo.bindings["source-1"] = []store.Binding{{
+		SourceID:          "source-1",
+		BindingID:         "binding-1",
+		BindingGeneration: 1,
+		Status:            BindingStatusActive,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}}
+	repo.objects["source-1\x00binding-1\x00folder-1"] = store.SourceObject{
+		SourceID:    "source-1",
+		BindingID:   "binding-1",
+		ObjectKey:   "folder-1",
+		IsContainer: true,
+		HasChildren: true,
+	}
+	scheduler := &sourceScheduleSpy{}
+	engine := newTestSourceEngineWithSchedule(t, repo, &sourceCoreSpy{}, &sourceSpyConnector{}, scheduler, now)
+
+	_, err := engine.TriggerSourceSync(context.Background(), TriggerSourceSyncRequest{
+		SourceID:  "source-1",
+		BindingID: "binding-1",
+		RequestID: "request-1",
+		ScopeType: string(connector.ScopeTypePartial),
+		ScopeRef:  map[string]any{"object_key": "folder-1"},
+	})
+	if err != nil {
+		t.Fatalf("trigger source sync: %v", err)
+	}
+	if len(scheduler.manual) != 1 {
+		t.Fatalf("expected one manual sync, got %+v", scheduler.manual)
+	}
+	if scheduler.manual[0].ScopeRef["node_ref"] != "folder-1" || scheduler.manual[0].ScopeRef["subtree_root"] != "folder-1" {
+		t.Fatalf("indexed container object_key should be converted to subtree sync: %+v", scheduler.manual[0])
+	}
+}
+
 func TestCreateSourceDuplicateConnectorFingerprintCompensates(t *testing.T) {
 	t.Parallel()
 
@@ -343,6 +553,56 @@ func TestListSourcesReturnsPlanFlatItems(t *testing.T) {
 	item := resp.Items[0]
 	if item.SourceID != "source-1" || item.Name != "Docs" || item.DatasetID != "dataset-1" || item.BindingCount != 2 || item.ConfigVersion != 2 {
 		t.Fatalf("source list item was not flat plan shape: %+v", item)
+	}
+}
+
+func TestListSourcesAttachesBatchAuthConnectionStatus(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	repo.listRecords = []store.SourceListRecord{
+		{Source: store.Source{SourceID: "source-1", TenantID: "tenant-1", CreatedBy: "user-1", Name: "Docs", DatasetID: "dataset-1", Status: SourceStatusActive, CreatedAt: now, UpdatedAt: now}, BindingCount: 2},
+		{Source: store.Source{SourceID: "source-2", TenantID: "tenant-1", CreatedBy: "user-1", Name: "Sheets", DatasetID: "dataset-2", Status: SourceStatusActive, CreatedAt: now, UpdatedAt: now}, BindingCount: 1},
+	}
+	repo.sources["source-1"] = repo.listRecords[0].Source
+	repo.sources["source-2"] = repo.listRecords[1].Source
+	repo.bindings["source-1"] = []store.Binding{
+		{SourceID: "source-1", BindingID: "binding-1", ConnectorType: "feishu", AuthConnectionID: "auth-1", Status: BindingStatusActive},
+		{SourceID: "source-1", BindingID: "binding-2", ConnectorType: "feishu", AuthConnectionID: "auth-2", Status: BindingStatusActive},
+	}
+	repo.bindings["source-2"] = []store.Binding{
+		{SourceID: "source-2", BindingID: "binding-3", ConnectorType: "feishu", AuthConnectionID: "auth-1", Status: BindingStatusActive},
+		{SourceID: "source-2", BindingID: "binding-4", ConnectorType: "local_fs", AgentID: "agent-1", Status: BindingStatusActive},
+	}
+	authStatus := &sourceAuthStatusStub{
+		statuses: map[string]AuthConnectionStatus{
+			"auth-1": {ConnectionID: "auth-1", Status: "ACTIVE"},
+		},
+	}
+	engine := newTestSourceEngineWithScheduleAndAuthStatus(t, repo, &sourceCoreSpy{}, &sourceSpyConnector{}, sourceTestScheduleEngine{}, authStatus, now)
+
+	resp, err := engine.ListSources(context.Background(), ListSourcesRequest{CallerID: "user-1", TenantID: "tenant-1"})
+	if err != nil {
+		t.Fatalf("list sources: %v", err)
+	}
+	if authStatus.calls != 1 {
+		t.Fatalf("expected one batch auth status call, got %d", authStatus.calls)
+	}
+	if !reflect.DeepEqual(authStatus.lastReq.ConnectionIDs, []string{"auth-1", "auth-2"}) {
+		t.Fatalf("unexpected batch auth ids: %#v", authStatus.lastReq.ConnectionIDs)
+	}
+	if authStatus.lastReq.UserID != "" || authStatus.lastReq.TenantID != "tenant-1" {
+		t.Fatalf("auth status request did not carry caller scope: %+v", authStatus.lastReq)
+	}
+	if resp.Items[0].AuthConnectionStatus == nil || resp.Items[0].AuthConnectionStatus.Status != "REVOKED" {
+		t.Fatalf("source-1 should aggregate missing auth-2 as revoked: %+v", resp.Items[0].AuthConnectionStatus)
+	}
+	if !reflect.DeepEqual(resp.Items[0].AuthConnectionStatus.ConnectionIDs, []string{"auth-1", "auth-2"}) {
+		t.Fatalf("unexpected source-1 connection ids: %#v", resp.Items[0].AuthConnectionStatus.ConnectionIDs)
+	}
+	if resp.Items[1].AuthConnectionStatus == nil || resp.Items[1].AuthConnectionStatus.Status != "ACTIVE" {
+		t.Fatalf("source-2 should aggregate active auth: %+v", resp.Items[1].AuthConnectionStatus)
 	}
 }
 
@@ -479,7 +739,8 @@ func TestUpdateBindingTargetChangeKeepsExistingTargetFieldsAndIncrementsGenerati
 			}
 		},
 	}
-	engine := newTestSourceEngine(t, repo, core, spy, now)
+	scheduler := &sourceScheduleSpy{triggerErr: errors.New("queue is down")}
+	engine := newTestSourceEngineWithSchedule(t, repo, core, spy, scheduler, now)
 
 	resp, err := engine.UpdateBinding(context.Background(), "user-1", "source-1", "binding-1", BindingInput{
 		TargetRef: "new",
@@ -497,6 +758,15 @@ func TestUpdateBindingTargetChangeKeepsExistingTargetFieldsAndIncrementsGenerati
 	if resp.OldGeneration != 3 || resp.NewGeneration != 4 {
 		t.Fatalf("expected generation increment, got old=%d new=%d", resp.OldGeneration, resp.NewGeneration)
 	}
+	if len(resp.JobIDs) != 0 || len(resp.CompensationErrors) != 0 {
+		t.Fatalf("target change should not create initial sync jobs: %+v", resp)
+	}
+	if len(scheduler.triggered) != 0 {
+		t.Fatalf("target change triggered initial sync: %+v", scheduler.triggered)
+	}
+	if len(repo.recordedJobErrors) != 0 {
+		t.Fatalf("target change should not record sync job errors: %+v", repo.recordedJobErrors)
+	}
 	updated := repo.bindings["source-1"][0]
 	if updated.TargetRef != "normalized-new" || updated.TargetFingerprint != "fp-new" || updated.TreeKey != "root-new" {
 		t.Fatalf("target fields were not replaced from ValidateTarget: %+v", updated)
@@ -509,6 +779,114 @@ func TestUpdateBindingTargetChangeKeepsExistingTargetFieldsAndIncrementsGenerati
 	}
 	if !repo.lastCleanup.ClearIndexedState || repo.lastCleanup.OldCoreParentDocumentID != "folder-old" {
 		t.Fatalf("target change cleanup was not requested: %+v", repo.lastCleanup)
+	}
+}
+
+func TestUpdateBindingLocalTargetChangeQueuesWatcherReload(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	repo.sources["source-1"] = store.Source{SourceID: "source-1", TenantID: "tenant-1", CreatedBy: "user-1", DatasetID: "dataset-1", Status: SourceStatusActive, CreatedAt: now, UpdatedAt: now}
+	repo.bindings["source-1"] = []store.Binding{{
+		BindingID:              "binding-1",
+		SourceID:               "source-1",
+		ConnectorType:          localFSConnectorType,
+		TargetType:             localFSTargetType,
+		TargetRef:              "/workspace/old",
+		TargetFingerprint:      "fp-old",
+		AgentID:                "agent-1",
+		TreeKey:                "local_fs:agent-1:path:/workspace/old",
+		BindingGeneration:      3,
+		CoreParentDocumentID:   "folder-old",
+		CoreParentDocumentName: "Old",
+		SyncMode:               SyncModeManual,
+		Status:                 BindingStatusActive,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+	}}
+	local := &sourceSpyConnector{
+		connectorType: connector.ConnectorType(localFSConnectorType),
+		targetType:    connector.TargetType(localFSTargetType),
+		targetFunc: func(req connector.ValidateTargetRequest) connector.NormalizedTarget {
+			return connector.NormalizedTarget{
+				TargetType:        req.TargetType,
+				TargetRef:         req.TargetRef,
+				TargetFingerprint: "fp-" + req.TargetRef,
+				DisplayName:       "Updated",
+				ProviderMeta:      connector.ProviderMeta{"agent_id": req.AgentID},
+				RootObjectKey:     "local_fs:" + req.AgentID + ":path:" + req.TargetRef,
+			}
+		},
+	}
+	engine := newTestSourceEngine(t, repo, &sourceCoreSpy{}, local, now)
+
+	_, err := engine.UpdateBinding(context.Background(), "user-1", "source-1", "binding-1", BindingInput{
+		TargetRef: "/workspace/new",
+		SyncMode:  SyncModeManual,
+	})
+	if err != nil {
+		t.Fatalf("update local binding: %v", err)
+	}
+	if len(repo.agentCommands) != 1 {
+		t.Fatalf("expected one watcher reload command, got %+v", repo.agentCommands)
+	}
+	command := repo.agentCommands[0]
+	if command.CommandType != agentCommandReloadSource || command.AgentID != "agent-1" {
+		t.Fatalf("unexpected watcher reload command: %+v", command)
+	}
+	if command.Payload[agentCommandRootPathKey] != "/workspace/new" || command.Payload["source_id"] != "source-1" || command.Payload["tenant_id"] != "tenant-1" {
+		t.Fatalf("reload_source payload lost updated target: %+v", command.Payload)
+	}
+}
+
+func TestUpdateBindingTargetChangeKeepsExistingDisplayNameForSingleFileTarget(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	repo.sources["source-1"] = store.Source{SourceID: "source-1", Name: "132", CreatedBy: "user-1", DatasetID: "dataset-1", Status: SourceStatusActive, CreatedAt: now, UpdatedAt: now}
+	repo.bindings["source-1"] = []store.Binding{{
+		BindingID:              "binding-1",
+		SourceID:               "source-1",
+		ConnectorType:          string(spyConnectorType),
+		TargetType:             string(spyTargetType),
+		TargetRef:              "old",
+		TargetFingerprint:      "fp-old",
+		TreeKey:                "root-old",
+		BindingGeneration:      3,
+		CoreParentDocumentID:   "folder-old",
+		CoreParentDocumentName: "Reports",
+		SyncMode:               SyncModeManual,
+		Status:                 BindingStatusActive,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+	}}
+	core := &sourceCoreSpy{}
+	spy := &sourceSpyConnector{
+		target: connector.NormalizedTarget{
+			TargetType:        spyTargetType,
+			TargetRef:         "wiki:space-1:node-pdf",
+			TargetFingerprint: "feishu:wiki:space-1:node-pdf",
+			DisplayName:       "ALCOHOLDINGS.pdf",
+			ProviderMeta:      connector.ProviderMeta{"kind": "wiki_node", "file_type": "file"},
+			RootObjectKey:     "feishu:wiki:space-1:node-pdf",
+		},
+	}
+	engine := newTestSourceEngine(t, repo, core, spy, now)
+
+	resp, err := engine.UpdateBinding(context.Background(), "user-1", "source-1", "binding-1", BindingInput{
+		TargetRef: "wiki:space-1:node-pdf",
+		SyncMode:  SyncModeManual,
+	})
+	if err != nil {
+		t.Fatalf("update binding: %v", err)
+	}
+	if len(core.folderRequests) != 1 || core.folderRequests[0].Name != "Reports" {
+		t.Fatalf("single-file target update should keep existing binding name, got %+v", core.folderRequests)
+	}
+	if resp.Binding.CoreParentDocumentName != "Reports" {
+		t.Fatalf("binding response should keep existing display name, got %+v", resp.Binding)
 	}
 }
 
@@ -613,7 +991,7 @@ func TestUpdateBindingScheduleChangeRecomputesNextSyncAndCancelsPendingScheduled
 	}
 }
 
-func TestAddBindingRecordsSyncJobErrorOnBindingAndCheckpoint(t *testing.T) {
+func TestAddBindingDoesNotTriggerInitialSync(t *testing.T) {
 	t.Parallel()
 
 	now := fixedSourceTestTime()
@@ -631,23 +1009,75 @@ func TestAddBindingRecordsSyncJobErrorOnBindingAndCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add binding: %v", err)
 	}
-	if len(resp.CompensationErrors) != 1 {
-		t.Fatalf("expected job warning, got %+v", resp)
+	if len(resp.JobIDs) != 0 || len(resp.CompensationErrors) != 0 {
+		t.Fatalf("add binding should not create initial sync jobs: %+v", resp)
 	}
-	if len(repo.recordedJobErrors) != 1 {
-		t.Fatalf("expected recorded sync job error, got %+v", repo.recordedJobErrors)
-	}
-	recorded := repo.recordedJobErrors[0]
-	if recorded.bindingID != resp.Binding.BindingID || recorded.generation != int64(1) || recorded.lastError["message"] != "queue is down" {
-		t.Fatalf("unexpected recorded job error: %+v", recorded)
+	if len(scheduler.triggered) != 0 {
+		t.Fatalf("add binding triggered initial sync: %+v", scheduler.triggered)
 	}
 	binding := repo.bindings["source-1"][0]
-	if binding.Status != BindingStatusActive || binding.LastError["message"] != "queue is down" {
-		t.Fatalf("binding should stay active with last_error: %+v", binding)
+	if binding.Status != BindingStatusActive || len(binding.LastError) != 0 {
+		t.Fatalf("binding should stay active without sync last_error: %+v", binding)
+	}
+	if len(repo.recordedJobErrors) != 0 {
+		t.Fatalf("add binding should not record sync job errors: %+v", repo.recordedJobErrors)
 	}
 }
 
-func TestCreateSourceDoesNotTriggerInitialSync(t *testing.T) {
+func TestCreateSourceDoesNotTriggerInitialSyncForAnySyncMode(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	scheduler := &sourceScheduleSpy{}
+	engine := newTestSourceEngineWithSchedule(t, repo, &sourceCoreSpy{}, &sourceSpyConnector{}, scheduler, now)
+
+	resp, err := engine.CreateSource(context.Background(), CreateSourceRequest{
+		CallerID:  "user-1",
+		TenantID:  "tenant-1",
+		RequestID: "request-1",
+		Name:      "Docs",
+		Bindings: []BindingInput{
+			{
+				ConnectorType: spyConnectorType,
+				TargetType:    spyTargetType,
+				TargetRef:     "target-1",
+				SyncMode:      SyncModeManual,
+			},
+			{
+				ConnectorType:  spyConnectorType,
+				TargetType:     spyTargetType,
+				TargetRef:      "target-2",
+				SyncMode:       SyncModeScheduled,
+				SchedulePolicy: sourceTestSchedulePolicy("UTC", sourceTestScheduleRule([]string{"everyday"}, "02:00:00")),
+			},
+			{
+				ConnectorType: spyConnectorType,
+				TargetType:    spyTargetType,
+				TargetRef:     "target-3",
+				SyncMode:      SyncModeWatch,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	if len(resp.JobIDs) != 0 || len(resp.JobErrors) != 0 {
+		t.Fatalf("create source should not return initial sync jobs: %+v", resp)
+	}
+	op := repo.operations["user-1\x00request-1"]
+	if op.Status != OperationStatusSucceeded {
+		t.Fatalf("operation should succeed without initial sync enqueue, got %+v", op)
+	}
+	if len(scheduler.triggered) != 0 {
+		t.Fatalf("create source triggered initial sync: %+v", scheduler.triggered)
+	}
+	if len(repo.recordedJobErrors) != 0 {
+		t.Fatalf("create source should not record sync job errors: %+v", repo.recordedJobErrors)
+	}
+}
+
+func TestCreateSourceDoesNotRecordInitialSyncWarning(t *testing.T) {
 	t.Parallel()
 
 	now := fixedSourceTestTime()
@@ -671,17 +1101,105 @@ func TestCreateSourceDoesNotTriggerInitialSync(t *testing.T) {
 		t.Fatalf("create source: %v", err)
 	}
 	if len(resp.JobIDs) != 0 || len(resp.JobErrors) != 0 {
-		t.Fatalf("create source should not enqueue sync jobs: %+v", resp)
+		t.Fatalf("create source should not return initial sync warning: %+v", resp)
 	}
 	op := repo.operations["user-1\x00request-1"]
 	if op.Status != OperationStatusSucceeded {
 		t.Fatalf("operation should succeed without sync warning, got %+v", op)
 	}
+	if len(op.Warning) != 0 {
+		t.Fatalf("operation should not persist sync warning details: %+v", op.Warning)
+	}
 	if len(scheduler.triggered) != 0 {
-		t.Fatalf("create source should not trigger initial sync: %+v", scheduler.triggered)
+		t.Fatalf("create source triggered initial sync: %+v", scheduler.triggered)
 	}
 	if len(repo.recordedJobErrors) != 0 {
 		t.Fatalf("create source should not record sync job errors: %+v", repo.recordedJobErrors)
+	}
+}
+
+func TestCreateSourceSyncStrategyMatrix(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	cases := []struct {
+		name         string
+		syncMode     string
+		explicitSync bool
+		wantNextSync bool
+	}{
+		{name: "manual create only", syncMode: SyncModeManual},
+		{name: "manual create and sync", syncMode: SyncModeManual, explicitSync: true},
+		{name: "scheduled create only", syncMode: SyncModeScheduled, wantNextSync: true},
+		{name: "scheduled create and sync", syncMode: SyncModeScheduled, explicitSync: true, wantNextSync: true},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			repo := newSourceEngineRepoStub()
+			scheduler := &sourceScheduleSpy{usePolicyNextSync: true}
+			engine := newTestSourceEngineWithSchedule(t, repo, &sourceCoreSpy{}, &sourceSpyConnector{}, scheduler, now)
+			bindingInput := BindingInput{
+				ConnectorType: spyConnectorType,
+				TargetType:    spyTargetType,
+				TargetRef:     "target-1",
+				SyncMode:      tc.syncMode,
+			}
+			if tc.syncMode == SyncModeScheduled {
+				bindingInput.SchedulePolicy = sourceTestSchedulePolicy("UTC", sourceTestScheduleRule([]string{"everyday"}, "02:00:00"))
+			}
+
+			createResp, err := engine.CreateSource(context.Background(), CreateSourceRequest{
+				CallerID:  "user-1",
+				TenantID:  "tenant-1",
+				RequestID: "create-" + tc.name,
+				Name:      "Docs",
+				Bindings:  []BindingInput{bindingInput},
+			})
+			if err != nil {
+				t.Fatalf("create source: %v", err)
+			}
+			if len(createResp.JobIDs) != 0 || len(createResp.JobErrors) != 0 || len(scheduler.triggered) != 0 {
+				t.Fatalf("create should not enqueue initial sync: resp=%+v triggered=%+v", createResp, scheduler.triggered)
+			}
+			binding := repo.bindings[createResp.Source.SourceID][0]
+			if tc.wantNextSync {
+				if binding.NextSyncAt == nil || !binding.NextSyncAt.After(now) {
+					t.Fatalf("scheduled create should keep a future next_sync_at: got=%v now=%v", binding.NextSyncAt, now)
+				}
+			} else if binding.NextSyncAt != nil {
+				t.Fatalf("manual create should not set next_sync_at: %+v", binding.NextSyncAt)
+			}
+
+			if !tc.explicitSync {
+				if len(scheduler.manual) != 0 {
+					t.Fatalf("create-only should not enqueue explicit sync: %+v", scheduler.manual)
+				}
+				return
+			}
+
+			triggerResp, err := engine.TriggerSourceSync(context.Background(), TriggerSourceSyncRequest{
+				SourceID:  createResp.Source.SourceID,
+				RequestID: "sync-" + tc.name,
+				ScopeType: string(connector.ScopeTypeFull),
+				ScopeRef:  map[string]any{},
+			})
+			if err != nil {
+				t.Fatalf("trigger source sync: %v", err)
+			}
+			if len(triggerResp.RunIDs) != 1 || len(scheduler.manual) != 1 {
+				t.Fatalf("create-and-sync should enqueue one explicit sync: resp=%+v manual=%+v", triggerResp, scheduler.manual)
+			}
+			if scheduler.manual[0].SourceID != createResp.Source.SourceID || scheduler.manual[0].BindingID != binding.BindingID || scheduler.manual[0].ScopeType != connector.ScopeTypeFull {
+				t.Fatalf("explicit sync request lost source/binding/full scope: %+v", scheduler.manual[0])
+			}
+			if len(scheduler.triggered) != 0 {
+				t.Fatalf("explicit sync should not use initial sync path: %+v", scheduler.triggered)
+			}
+		})
 	}
 }
 
@@ -741,6 +1259,41 @@ func TestDeleteBindingSoftDeletesAndDeletesCoreFolder(t *testing.T) {
 	}
 	if len(core.deleteRequests) != 1 || core.deleteRequests[0].DatasetID != "dataset-1" || core.deleteRequests[0].DocumentID != "folder-1" {
 		t.Fatalf("binding cleanup should call core document delete with dataset scope: %+v", core.deleteRequests)
+	}
+}
+
+func TestDeleteBindingQueuesLocalWatcherStop(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	repo.sources["source-1"] = store.Source{SourceID: "source-1", TenantID: "tenant-1", DatasetID: "dataset-1", Status: SourceStatusActive, CreatedAt: now, UpdatedAt: now}
+	repo.bindings["source-1"] = []store.Binding{{
+		BindingID:            "binding-1",
+		SourceID:             "source-1",
+		ConnectorType:        localFSConnectorType,
+		TargetType:           localFSTargetType,
+		TargetRef:            "/workspace/docs",
+		AgentID:              "agent-1",
+		CoreParentDocumentID: "folder-1",
+		SyncMode:             SyncModeManual,
+		Status:               BindingStatusActive,
+	}}
+	engine := newTestSourceEngine(t, repo, &sourceCoreSpy{}, &sourceSpyConnector{}, now)
+
+	_, err := engine.DeleteBinding(context.Background(), "source-1", "binding-1")
+	if err != nil {
+		t.Fatalf("delete local binding: %v", err)
+	}
+	if len(repo.agentCommands) != 1 {
+		t.Fatalf("expected one watcher stop command, got %+v", repo.agentCommands)
+	}
+	command := repo.agentCommands[0]
+	if command.CommandType != agentCommandStopSource || command.AgentID != "agent-1" {
+		t.Fatalf("unexpected watcher stop command: %+v", command)
+	}
+	if command.Payload["type"] != agentCommandStopSource || command.Payload["source_id"] != "source-1" || command.Payload[agentCommandRootPathKey] != nil {
+		t.Fatalf("stop_source payload should only stop by source identity: %+v", command.Payload)
 	}
 }
 
@@ -806,6 +1359,57 @@ func TestUpdateSourceWithBindingsUsesAtomicStoreContract(t *testing.T) {
 	}
 }
 
+func TestUpdateSourceWithNewBindingDoesNotTriggerInitialSync(t *testing.T) {
+	t.Parallel()
+
+	now := fixedSourceTestTime()
+	repo := newSourceEngineRepoStub()
+	repo.sources["source-1"] = store.Source{
+		SourceID:      "source-1",
+		TenantID:      "tenant-1",
+		CreatedBy:     "user-1",
+		Name:          "Docs",
+		DatasetID:     "dataset-1",
+		Status:        SourceStatusActive,
+		ConfigVersion: 7,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	scheduler := &sourceScheduleSpy{triggerErr: errors.New("queue is down")}
+	engine := newTestSourceEngineWithSchedule(t, repo, &sourceCoreSpy{}, &sourceSpyConnector{}, scheduler, now)
+
+	resp, err := engine.UpdateSource(context.Background(), "user-1", "source-1", UpdateSourceRequest{
+		ConfigVersion:    7,
+		BindingsProvided: true,
+		Bindings: []BindingInput{{
+			ConnectorType:  spyConnectorType,
+			TargetType:     spyTargetType,
+			TargetRef:      "target-new",
+			SyncMode:       SyncModeScheduled,
+			SchedulePolicy: sourceTestSchedulePolicy("UTC", sourceTestScheduleRule([]string{"everyday"}, "02:00:00")),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("update source: %v", err)
+	}
+	if len(resp.CreatedBindingIDs) != 1 || len(resp.UpdatedBindingIDs) != 0 || len(resp.RemovedBindingIDs) != 0 {
+		t.Fatalf("unexpected binding mutation summary: %+v", resp)
+	}
+	if len(resp.JobIDs) != 0 || len(resp.JobErrors) != 0 {
+		t.Fatalf("source update should not create initial sync jobs: %+v", resp)
+	}
+	if len(scheduler.triggered) != 0 {
+		t.Fatalf("source update triggered initial sync: %+v", scheduler.triggered)
+	}
+	binding := repo.bindings["source-1"][0]
+	if binding.Status != BindingStatusActive || len(binding.LastError) != 0 {
+		t.Fatalf("new binding should stay active without sync last_error: %+v", binding)
+	}
+	if len(repo.recordedJobErrors) != 0 {
+		t.Fatalf("source update should not record sync job errors: %+v", repo.recordedJobErrors)
+	}
+}
+
 func assertNoSourceTargetFields(t *testing.T, src store.Source) {
 	t.Helper()
 	sourceType := reflect.TypeOf(src)
@@ -821,6 +1425,10 @@ func newTestSourceEngine(t *testing.T, repo *sourceEngineRepoStub, core *sourceC
 }
 
 func newTestSourceEngineWithSchedule(t *testing.T, repo *sourceEngineRepoStub, core *sourceCoreSpy, spy *sourceSpyConnector, scheduler ScheduleEngine, now time.Time) *DefaultEngine {
+	return newTestSourceEngineWithScheduleAndAuthStatus(t, repo, core, spy, scheduler, nil, now)
+}
+
+func newTestSourceEngineWithScheduleAndAuthStatus(t *testing.T, repo *sourceEngineRepoStub, core *sourceCoreSpy, spy *sourceSpyConnector, scheduler ScheduleEngine, authStatus AuthConnectionStatusClient, now time.Time) *DefaultEngine {
 	t.Helper()
 	registry, err := connector.NewDefaultConnectorRegistry(spy)
 	if err != nil {
@@ -834,6 +1442,7 @@ func newTestSourceEngineWithSchedule(t *testing.T, repo *sourceEngineRepoStub, c
 		WithClock(func() time.Time { return now }),
 		WithIDGenerator(sourceTestIDGenerator()),
 		WithDefaultDatasetAlgo(coreclient.DatasetAlgo{AlgoID: "general_algo", DisplayName: "General"}),
+		WithAuthConnectionStatusClient(authStatus),
 	)
 }
 
@@ -860,16 +1469,23 @@ func (sourceTestScheduleEngine) EnqueueManualSync(context.Context, scheduleengin
 }
 
 type sourceScheduleSpy struct {
-	triggered  []store.Binding
-	manual     []scheduleengine.ManualSyncRequest
-	triggerErr error
-	nextSyncAt *time.Time
+	triggered         []store.Binding
+	manual            []scheduleengine.ManualSyncRequest
+	triggerErr        error
+	nextSyncAt        *time.Time
+	usePolicyNextSync bool
 }
 
 func (s *sourceScheduleSpy) BuildCheckpoint(_ context.Context, binding store.Binding, now time.Time) (store.SyncCheckpoint, error) {
 	nextSyncAt := binding.NextSyncAt
 	if s.nextSyncAt != nil {
 		nextSyncAt = s.nextSyncAt
+	} else if s.usePolicyNextSync && binding.SyncMode == SyncModeScheduled {
+		next, err := scheduleengine.NextSyncAt(binding.SchedulePolicy, now)
+		if err != nil {
+			return store.SyncCheckpoint{}, err
+		}
+		nextSyncAt = &next
 	}
 	return store.SyncCheckpoint{
 		SourceID:          binding.SourceID,
@@ -987,6 +1603,8 @@ func assertSourceJSONNumber(t *testing.T, value any, want string) {
 }
 
 type sourceSpyConnector struct {
+	connectorType    connector.ConnectorType
+	targetType       connector.TargetType
 	target           connector.NormalizedTarget
 	targetFunc       func(connector.ValidateTargetRequest) connector.NormalizedTarget
 	validateRequests []connector.ValidateTargetRequest
@@ -994,8 +1612,8 @@ type sourceSpyConnector struct {
 
 func (c *sourceSpyConnector) Spec() connector.ConnectorSpec {
 	return connector.ConnectorSpec{
-		ConnectorType:         spyConnectorType,
-		TargetTypes:           []connector.TargetType{spyTargetType},
+		ConnectorType:         c.expectedConnectorType(),
+		TargetTypes:           []connector.TargetType{c.expectedTargetType()},
 		SupportsExportFormats: []connector.ExportFormat{connector.ExportFormatOriginal},
 		MaxPageSize:           100,
 	}
@@ -1006,7 +1624,7 @@ func (c *sourceSpyConnector) ValidateTarget(_ context.Context, req connector.Val
 	if req.UserID == "" {
 		return connector.NormalizedTarget{}, connector.NewError(connector.ErrorCodeInvalidArgument, "user_id is required")
 	}
-	if req.ConnectorType != spyConnectorType || req.TargetType != spyTargetType || req.TargetRef == "" {
+	if req.ConnectorType != c.expectedConnectorType() || req.TargetType != c.expectedTargetType() || req.TargetRef == "" {
 		return connector.NormalizedTarget{}, connector.NewError(connector.ErrorCodeInvalidTarget, "invalid target")
 	}
 	if c.targetFunc != nil {
@@ -1022,6 +1640,20 @@ func (c *sourceSpyConnector) ValidateTarget(_ context.Context, req connector.Val
 		DisplayName:       req.TargetRef,
 		RootObjectKey:     req.TargetRef,
 	}, nil
+}
+
+func (c *sourceSpyConnector) expectedConnectorType() connector.ConnectorType {
+	if c.connectorType != "" {
+		return c.connectorType
+	}
+	return spyConnectorType
+}
+
+func (c *sourceSpyConnector) expectedTargetType() connector.TargetType {
+	if c.targetType != "" {
+		return c.targetType
+	}
+	return spyTargetType
 }
 
 func (c *sourceSpyConnector) ListChildren(context.Context, connector.ListChildrenRequest) (connector.RawObjectPage, error) {
@@ -1092,7 +1724,9 @@ type sourceEngineRepoStub struct {
 	sources             map[string]store.Source
 	bindings            map[string][]store.Binding
 	listRecords         []store.SourceListRecord
+	objects             map[string]store.SourceObject
 	createRecords       []store.SourceCreateRecord
+	agentCommands       []store.AgentCommand
 	recordedJobErrors   []recordedSyncJobError
 	lastCleanup         store.BindingUpdateCleanup
 	failUpdateMutation  bool
@@ -1113,6 +1747,7 @@ func newSourceEngineRepoStub() *sourceEngineRepoStub {
 		operations: map[string]store.CreateOperation{},
 		sources:    map[string]store.Source{},
 		bindings:   map[string][]store.Binding{},
+		objects:    map[string]store.SourceObject{},
 	}
 }
 
@@ -1202,6 +1837,26 @@ func (r *sourceEngineRepoStub) ListBindings(_ context.Context, sourceID string) 
 	return append([]store.Binding(nil), r.bindings[sourceID]...), nil
 }
 
+func (r *sourceEngineRepoStub) ListBindingsBySourceIDs(_ context.Context, sourceIDs []string) ([]store.Binding, error) {
+	sourceSet := map[string]struct{}{}
+	for _, sourceID := range sourceIDs {
+		sourceSet[sourceID] = struct{}{}
+	}
+	out := []store.Binding{}
+	for sourceID, bindings := range r.bindings {
+		if _, ok := sourceSet[sourceID]; !ok {
+			continue
+		}
+		for _, binding := range bindings {
+			if binding.Status == BindingStatusDeleting {
+				continue
+			}
+			out = append(out, binding)
+		}
+	}
+	return out, nil
+}
+
 func (r *sourceEngineRepoStub) GetBinding(_ context.Context, sourceID, bindingID string) (store.Binding, error) {
 	for _, binding := range r.bindings[sourceID] {
 		if binding.BindingID == bindingID {
@@ -1209,6 +1864,34 @@ func (r *sourceEngineRepoStub) GetBinding(_ context.Context, sourceID, bindingID
 		}
 	}
 	return store.Binding{}, store.NewStoreError(store.ErrCodeBindingNotFound, "binding not found")
+}
+
+type sourceAuthStatusStub struct {
+	calls    int
+	lastReq  AuthConnectionStatusRequest
+	statuses map[string]AuthConnectionStatus
+	err      error
+}
+
+func (s *sourceAuthStatusStub) BatchStatus(_ context.Context, req AuthConnectionStatusRequest) (map[string]AuthConnectionStatus, error) {
+	s.calls++
+	s.lastReq = req
+	if s.err != nil {
+		return nil, s.err
+	}
+	out := make(map[string]AuthConnectionStatus, len(s.statuses))
+	for key, value := range s.statuses {
+		out[key] = value
+	}
+	return out, nil
+}
+
+func (r *sourceEngineRepoStub) GetObject(_ context.Context, sourceID, bindingID, objectKey string) (store.SourceObject, error) {
+	object, ok := r.objects[sourceID+"\x00"+bindingID+"\x00"+objectKey]
+	if !ok {
+		return store.SourceObject{}, store.NewStoreError(store.ErrCodeNotFound, "object not found")
+	}
+	return object, nil
 }
 
 func (r *sourceEngineRepoStub) FindActiveBindingByTarget(_ context.Context, sourceID, excludeBindingID, connectorType, targetType, targetFingerprint string) (store.Binding, bool, error) {
@@ -1247,6 +1930,11 @@ func (r *sourceEngineRepoStub) RecordSyncJobError(_ context.Context, sourceID, b
 		}
 	}
 	return store.NewStoreError(store.ErrCodeGenerationConflict, "binding generation is stale")
+}
+
+func (r *sourceEngineRepoStub) CreateAgentCommand(_ context.Context, command store.AgentCommand) error {
+	r.agentCommands = append(r.agentCommands, command)
+	return nil
 }
 
 func (r *sourceEngineRepoStub) UpdateBinding(_ context.Context, binding store.Binding, _ store.SyncCheckpoint, cleanup store.BindingUpdateCleanup) error {

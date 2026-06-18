@@ -46,6 +46,32 @@ type Token struct {
 	AccessToken string
 }
 
+type ConnectionStatusRequest struct {
+	ConnectionIDs []string
+	UserID        string
+	TenantID      string
+}
+
+type ConnectionListRequest struct {
+	Provider string
+	Limit    int
+}
+
+type ConnectionStatus struct {
+	ConnectionID      string
+	TenantID          string
+	OwnerUserID       string
+	Provider          string
+	AuthMode          string
+	ProviderAccountID string
+	DisplayName       string
+	ProviderTenantKey string
+	Status            string
+	LastError         string
+	LastUsedAt        string
+	UpdatedAt         string
+}
+
 type ObjectKind string
 
 const (
@@ -57,21 +83,23 @@ const (
 )
 
 type Object struct {
-	Kind            ObjectKind
-	Token           string
-	ParentToken     string
-	SpaceID         string
-	Name            string
-	IsDocument      bool
-	IsContainer     bool
-	HasChildren     bool
-	Revision        string
-	ModifiedUnixSec int64
-	SizeBytes       int64
-	MimeType        string
-	FileExtension   string
-	DriveType       string
-	StableID        string
+	Kind                ObjectKind
+	Token               string
+	ParentToken         string
+	SpaceID             string
+	Name                string
+	IsDocument          bool
+	IsContainer         bool
+	HasChildren         bool
+	Revision            string
+	ModifiedUnixSec     int64
+	SizeBytes           int64
+	MimeType            string
+	FileExtension       string
+	DriveType           string
+	ShortcutTargetType  string
+	ShortcutTargetToken string
+	StableID            string
 }
 
 type ObjectPage struct {

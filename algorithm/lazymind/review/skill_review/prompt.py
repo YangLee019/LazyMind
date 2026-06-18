@@ -65,35 +65,46 @@ value_type candidates: success_pattern, failure_pattern, reasoning_pattern, retr
 """
 
 
-def contextual_description_prompt(trajectory: str) -> str:
+def cluster_signature_prompt(trajectory: str) -> str:
     return f"""
 You are an expert Agent Memory Abstraction Engine, your task is to summarize the trajectory into a structured "contextual_description" for future task clustering and skill mining.
 
-Extract the high-level task context and execution outcome from the trajectory, the output should describe:
-1. What the agent tried to achieve
-2. In what scenario/environment
-3. What strategy/process it used
-4. What key result/outcome was obtained
-5. What tools/skills/environment were involved
+Your task is to extract a compact "cluster_signature" for future task clustering and skill mining.
+
+# Objective
+
+Extract only the reusable task structure needed to decide whether multiple drafts should become one skill.
+
+The output should describe:
+1. The reusable task intent
+2. The high-level reusable procedure
+3. The applicability boundary for the skill
 
 # Requirements
 
-- Focus on task-level abstraction instead of low-level actions
-- Preserve only reusable and clusterable information
-- Remove noisy operational details
-- Avoid case-specific wording
-- The description should be generic enough to group similar tasks together
-- If the task failed, explicitly explain the failure reason briefly
+- Preserve reusable workflow structure, not case-specific details
+- Describe the broad reusable skill family, not the narrow observed case
+- Keep wording general enough for reusable skill mining, but not vague
+- Remove names, ids, dates, locations, prices, exact quantities, and incidental tool errors
+- Do not mention exact tool names unless they define the reusable task
+- Do not include every observed root cause in the intent; prefer a task-family description
+- Do not include fallback options, alternative resolutions, or customer choice variants in the intent unless they define a materially different workflow
+- Merge adjacent diagnostics into broader steps when they belong to the same troubleshooting workflow
+- Use 3-6 procedure steps
+- Boundaries must be one concise paragraph describing the positive applicability scope and only materially different workflows it should not cover
+- Do not exclude nearby variants that the same reusable procedure can handle
+- Do not exclude alternative remediation options, fallback paths, optional checks, or customer preference variants that belong to the same task family
+- Do not exclude cases based on incidental episode outcomes, such as whether a tool succeeded or failed
+- Avoid vague phrases like "help the user" or "solve the issue"
 - output should be in the same language as the trajectory
 
 # Output Format
 
 Return ONLY valid JSON:
 {{
-  "task_goal": "...",
-  "applicable_scenario": "...",
-  "execution_summary": "...",
-  "key_result": "..."
+  "intent": "...",
+  "procedure": ["...", "...", "..."],
+  "boundaries": "..."
 }}
 
 # Trajectory
@@ -164,13 +175,13 @@ def pending_skill_draft_prompt(skill_name: str, skill_content: str) -> str:
 You are an expert Skill Review Refactoring Engine, your task is to convert an existing pending skill into a reusable skill draft.
 The pending skill is already structured, so extract only the three core parts needed by the skill mining pipeline:
 
-1. contextual_description
+1. cluster_signature
 2. refined_trajectory
 3. guidelines
 
 # Requirements
 
-- Use the title to identify the intended scenario, task goal, and capability.
+- Use the title and content to identify the reusable intent, procedure, and applicability boundary.
 - Split the skill content into meaningful operational steps for refined_trajectory.
 - Summarize the guidance embedded in each step into concise guidelines.
 - Keep the output abstract and reusable; do not copy Markdown headings mechanically.
@@ -181,11 +192,10 @@ The pending skill is already structured, so extract only the three core parts ne
 
 Return ONLY valid JSON:
 {{
-  "contextual_description": {{
-    "task_goal": "...",
-    "applicable_scenario": "...",
-    "execution_summary": "...",
-    "key_result": "..."
+  "cluster_signature": {{
+    "intent": "...",
+    "procedure": ["...", "...", "..."],
+    "boundaries": "..."
   }},
   "refined_trajectory": {{
     "steps": [
@@ -275,8 +285,8 @@ Return ONLY valid JSON:
 def draft_prompt(trajectory: dict[str, Any]) -> str:
     return (
         'You extract a reusable skill draft from one agent trajectory.\n'
-        'Return JSON only with keys: contextual_description, refined_trajectory, guidelines.\n'
-        'contextual_description has task_goal, applicable_scenario, execution_summary, key_result, environment.\n'
+        'Return JSON only with keys: cluster_signature, refined_trajectory, guidelines.\n'
+        'cluster_signature has intent, procedure, boundaries.\n'
         'refined_trajectory has steps: step_index, role, action, state, tool_name, skill_name.\n'
         'guidelines has success_patterns and failure_patterns, each item has related_step and guideline.\n\n'
         f'TRAJECTORY:\n{json.dumps(trajectory, ensure_ascii=False, indent=2)}'
@@ -285,8 +295,20 @@ def draft_prompt(trajectory: dict[str, Any]) -> str:
 
 def cluster_prompt(drafts: list[dict[str, Any]]) -> str:
     return (
-        'Cluster skill drafts by task type. Return JSON only: {"clusters":[{"task_scope":"...","draft_indexes":[0]}]}.\n'
-        f'DRAFTS:\n{json.dumps(drafts, ensure_ascii=False, indent=2)}'
+        'Cluster skill draft signatures into reusable skill families.\n'
+        'Return JSON only: {"clusters":[{"task_scope":"...","draft_indexes":[0]}]}.\n\n'
+        'Merge drafts when they share the same reusable task intent, high-level procedure, and applicability scope.\n'
+        'Do not split drafts merely because one case has an extra root cause, a different outcome, a tool failure, '
+        'a different language/style, or a narrower boundary statement.\n'
+        'Do not split drafts merely because one includes an extra fallback option, alternative remediation path, '
+        'plan/customer choice variant, or broader/narrower wording.\n'
+        'Keep drafts separate only when an agent would need a materially different procedure or the combined skill '
+        'would become ambiguous.\n'
+        'A singleton cluster is allowed only when no existing cluster can handle that draft without changing the core procedure.\n'
+        'If a draft differs only by an extra fallback option, broader wording, or an alternative customer choice, '
+        'merge it into the closest broader cluster.\n'
+        'Every draft index must appear exactly once. Use the provided draft_index values.\n\n'
+        f'DRAFT_SIGNATURES:\n{json.dumps(drafts, ensure_ascii=False, indent=2)}'
     )
 
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -59,6 +60,128 @@ func TestHTTPAuthConnectionClientVerifyUsesOwnerScope(t *testing.T) {
 	client := newHTTPAuthTestClient(t, server.URL)
 	if err := client.Verify(context.Background(), "auth-1", "user-1", "tenant-1"); err != nil {
 		t.Fatalf("verify auth connection: %v", err)
+	}
+}
+
+func TestHTTPAuthConnectionClientBatchStatus(t *testing.T) {
+	t.Parallel()
+
+	var requestBody struct {
+		ConnectionIDs []string `json:"connection_ids"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+		if r.URL.Path != "/api/authservice/v1/cloud/connections/status:batch" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("user_id") != "user-1" || r.URL.Query().Get("tenant_id") != "tenant-1" {
+			t.Fatalf("batch status request did not include owner scope: %s", r.URL.RawQuery)
+		}
+		if r.Header.Get("X-LazyMind-Internal-Token") != "internal-token" {
+			t.Fatalf("missing internal service token")
+		}
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		writeFeishuJSON(t, w, http.StatusOK, map[string]any{
+			"items": []map[string]any{
+				{"connection_id": "auth-1", "provider": "feishu", "status": "ACTIVE"},
+				{"connection_id": "auth-2", "provider": "feishu", "status": "REVOKED", "last_error": "deleted"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := newHTTPAuthTestClient(t, server.URL)
+	statuses, err := client.BatchStatus(context.Background(), ConnectionStatusRequest{
+		ConnectionIDs: []string{"auth-1", "auth-2", "auth-1", ""},
+		UserID:        "user-1",
+		TenantID:      "tenant-1",
+	})
+	if err != nil {
+		t.Fatalf("batch status: %v", err)
+	}
+	if !reflect.DeepEqual(requestBody.ConnectionIDs, []string{"auth-1", "auth-2"}) {
+		t.Fatalf("connection ids were not deduped: %#v", requestBody.ConnectionIDs)
+	}
+	if statuses["auth-1"].Status != "ACTIVE" || statuses["auth-2"].Status != "REVOKED" || statuses["auth-2"].LastError != "deleted" {
+		t.Fatalf("unexpected statuses: %+v", statuses)
+	}
+}
+
+func TestHTTPAuthConnectionClientListTargetCacheConnections(t *testing.T) {
+	t.Parallel()
+
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+		if r.URL.Path != "/api/authservice/v1/cloud/connections/internal/target-cache-candidates" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("provider") != "feishu" || r.URL.Query().Get("limit") != "50" {
+			t.Fatalf("unexpected target cache query: %s", r.URL.RawQuery)
+		}
+		if r.Header.Get("X-LazyMind-Internal-Token") != "internal-token" {
+			t.Fatalf("missing internal service token")
+		}
+		body := `{"code":200,"message":"success","data":{"items":[{"connection_id":"auth-1","owner_user_id":"user-1","provider":"feishu","provider_tenant_key":"tenant-demo","status":"active"}]}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+	client, err := NewHTTPAuthConnectionClient("http://auth.test", "internal-token", httpClient)
+	if err != nil {
+		t.Fatalf("create auth client: %v", err)
+	}
+	items, err := client.ListTargetCacheConnections(context.Background(), ConnectionListRequest{Provider: "feishu", Limit: 50})
+	if err != nil {
+		t.Fatalf("list target cache connections: %v", err)
+	}
+	if len(items) != 1 || items[0].ConnectionID != "auth-1" || items[0].ProviderTenantKey != "tenant-demo" || items[0].Status != "ACTIVE" {
+		t.Fatalf("unexpected target cache connections: %+v", items)
+	}
+}
+
+func TestOpenAPIPagesRespectExplicitHasMoreFalse(t *testing.T) {
+	t.Parallel()
+
+	hasMore := false
+	drive := driveObjectPage(openAPIDriveFiles{
+		Files: []map[string]any{
+			{"type": "file", "token": "file-1", "name": "File"},
+		},
+		PageToken: "echoed-token",
+		HasMore:   &hasMore,
+	}, "root")
+	if drive.HasMore {
+		t.Fatalf("drive page should respect explicit has_more=false: %+v", drive)
+	}
+
+	spaces := wikiSpacesPage(openAPIWikiSpaces{
+		Items: []map[string]any{
+			{"space_id": "space-1", "name": "Space"},
+		},
+		PageToken: "echoed-token",
+		HasMore:   &hasMore,
+	})
+	if spaces.HasMore {
+		t.Fatalf("wiki spaces page should respect explicit has_more=false: %+v", spaces)
+	}
+
+	nodes := wikiNodesPage(openAPIWikiNodes{
+		Items: []map[string]any{
+			{"node_token": "node-1", "title": "Node"},
+		},
+		PageToken: "echoed-token",
+		HasMore:   &hasMore,
+	}, "space-1", "")
+	if nodes.HasMore {
+		t.Fatalf("wiki nodes page should respect explicit has_more=false: %+v", nodes)
 	}
 }
 
@@ -140,8 +263,12 @@ func TestDefaultFeishuAPIClientDriveAndWikiMapping(t *testing.T) {
 	if _, err := client.ListDriveChildren(context.Background(), "user-token", "folder-1", "cursor-1", 50); err != nil {
 		t.Fatalf("list drive children: %v", err)
 	}
-	if _, err := client.DownloadDriveFile(context.Background(), "user-token", "file-1", "rev-1"); err != nil {
+	downloaded, err := client.DownloadDriveFile(context.Background(), "user-token", "file-1", "rev-1")
+	if err != nil {
 		t.Fatalf("download drive file: %v", err)
+	}
+	if downloaded.SizeBytes != int64(len("drive-bytes")) {
+		t.Fatalf("download should expose content size, got %+v", downloaded)
 	}
 	if _, err := client.ListWikiSpaces(context.Background(), "user-token", "cursor-2", 25); err != nil {
 		t.Fatalf("list wiki spaces: %v", err)
@@ -160,6 +287,98 @@ func TestDefaultFeishuAPIClientDriveAndWikiMapping(t *testing.T) {
 	}
 	if seen["drive_download"] != "yes" || seen["wiki_export"] != "yes" {
 		t.Fatalf("export APIs were not called: %+v", seen)
+	}
+}
+
+func TestDefaultFeishuAPIClientExportsWikiFileNodeWithDriveDownload(t *testing.T) {
+	t.Parallel()
+
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/open-apis/wiki/v2/spaces/get_node":
+			writeFeishuOpenAPIData(t, w, map[string]any{"node": map[string]any{
+				"space_id":   "space-1",
+				"node_token": "node-1",
+				"title":      "ALCOHOLDINGS.pdf",
+				"obj_type":   "file",
+				"obj_token":  "file-1",
+			}})
+		case "/open-apis/drive/v1/files/file-1/download":
+			_, _ = w.Write([]byte("%PDF-1.7"))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := newHTTPFeishuAPITestClient(t, server.URL)
+	exported, err := client.ExportWikiNodeMarkdown(context.Background(), "user-token", "space-1", "node-1", "wiki-rev")
+	if err != nil {
+		t.Fatalf("export wiki file node: %v", err)
+	}
+	if string(exported.Content) != "%PDF-1.7" || exported.SizeBytes != int64(len("%PDF-1.7")) || exported.FileExtension != ".pdf" || exported.MimeType != "application/pdf" || exported.ExportedVersion != "wiki-rev" {
+		t.Fatalf("unexpected wiki file export: %+v", exported)
+	}
+	if len(paths) != 2 || paths[0] != "/open-apis/wiki/v2/spaces/get_node" || paths[1] != "/open-apis/drive/v1/files/file-1/download" {
+		t.Fatalf("unexpected request sequence: %v", paths)
+	}
+}
+
+func TestDriveObjectMapsShortcutTargetMetadata(t *testing.T) {
+	t.Parallel()
+
+	obj := driveObject(map[string]any{
+		"type":     "shortcut",
+		"token":    "shortcut-1",
+		"name":     "alias.pdf",
+		"revision": "rev-1",
+		"shortcut_info": map[string]any{
+			"target_type":  "file",
+			"target_token": "file-target",
+		},
+	}, "folder-1")
+
+	if obj.DriveType != "shortcut" || obj.ShortcutTargetType != "file" || obj.ShortcutTargetToken != "file-target" {
+		t.Fatalf("shortcut target metadata was not mapped: %+v", obj)
+	}
+}
+
+func TestDriveObjectUsesUpdatedTimeFallbackForVersion(t *testing.T) {
+	t.Parallel()
+
+	obj := driveObject(map[string]any{
+		"type":         "file",
+		"token":        "file-1",
+		"name":         "Guide.md",
+		"updated_time": "1710002222",
+	}, "folder-1")
+
+	if obj.Revision != "1710002222" || versionFor(obj) != "1710002222" {
+		t.Fatalf("drive version should use updated_time fallback, got revision=%q version=%q", obj.Revision, versionFor(obj))
+	}
+}
+
+func TestWikiNodeObjectUsesModifiedTimeFallbacksForVersion(t *testing.T) {
+	t.Parallel()
+
+	for _, field := range []string{"modified_time", "node_update_time", "obj_update_time"} {
+		field := field
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+
+			obj := wikiNodeObject(map[string]any{
+				"node_token": "node-1",
+				"obj_type":   "docx",
+				"obj_token":  "docx-1",
+				field:        "1710003333",
+			}, "space-1", "")
+
+			if obj.Revision != "1710003333" || versionFor(obj) != "1710003333" {
+				t.Fatalf("wiki version should use %s fallback, got revision=%q version=%q", field, obj.Revision, versionFor(obj))
+			}
+		})
 	}
 }
 
@@ -300,6 +519,13 @@ func TestDefaultFeishuAPIClientMapsScopeMissing(t *testing.T) {
 	client := newHTTPFeishuAPITestClient(t, server.URL)
 	_, err := client.GetDriveRoot(context.Background(), "user-token")
 	assertFeishuErrorCode(t, err, connector.ErrorCodePermissionDenied)
+}
+
+func TestFeishuOpenAPIMapsFrequencyLimitAsRateLimited(t *testing.T) {
+	t.Parallel()
+
+	err := mapFeishuOpenAPIError("99991400", "request trigger frequency limit", http.StatusOK)
+	assertFeishuErrorCode(t, err, connector.ErrorCodeRateLimited)
 }
 
 func newHTTPAuthTestClient(t *testing.T, baseURL string) *HTTPAuthConnectionClient {

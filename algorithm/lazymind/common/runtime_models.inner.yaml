@@ -44,3 +44,21 @@ vlm:
     name: lazyllm
     url: http://host.docker.internal:36517/v1/
     skip_auth: true
+
+speech_to_text:
+  - source: siliconflow
+    type: stt
+    name: FunAudioLLM/SenseVoiceSmall
+    api_key: ${LAZYLLM_SILICONFLOW_API_KEY}
+
+image_generator:
+  - source: siliconflow
+    type: text2image
+    name: Kwai-Kolors/Kolors
+    api_key: ${LAZYLLM_SILICONFLOW_API_KEY}
+
+image_editor:
+  - source: siliconflow
+    type: image_editing
+    name: Kwai-Kolors/Kolors
+    api_key: ${LAZYLLM_SILICONFLOW_API_KEY}

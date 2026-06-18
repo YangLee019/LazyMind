@@ -1,7 +1,7 @@
 import type { TFunction } from "i18next";
 
 export type SourceType = "local" | "s3" | "feishu" | "confluence" | "notion";
-export type SourceStatus = "active" | "expired" | "error" | "paused";
+export type SourceStatus = "active" | "expired" | "error" | "paused" | "deleted";
 export type ConnectionState = "connected" | "expired" | "error" | "pending";
 export type SyncMode = "manual" | "scheduled";
 export type ConflictPolicy = "overwrite" | "skip" | "versioned";
@@ -9,8 +9,43 @@ export type FileSyncMode = "all" | "partial";
 export type OAuthState = "pending" | "waiting" | "connected" | "expired" | "error";
 export type FileUpdateState = "new" | "changed" | "unchanged" | "deleted";
 export type FeishuTargetType = "wiki_space" | "drive_folder";
-export type DetailParseStatus = "parsed" | "reindexing" | "duplicate" | "deleted" | "failed";
-export type DataSourceKind = "local" | "feishu";
+export type NotionTargetType = "page" | "database";
+export type CloudTargetType = FeishuTargetType | NotionTargetType;
+export type DetailParseStatus =
+  | "parsed"
+  | "pending"
+  | "reindexing"
+  | "duplicate"
+  | "deleted"
+  | "failed";
+export type DataSourceKind = "local" | "feishu" | "notion";
+export type DataSourceFileType =
+  | "pdf"
+  | "doc"
+  | "docx"
+  | "hwp"
+  | "ppt"
+  | "pptx"
+  | "pptm"
+  | "jpg"
+  | "jpeg"
+  | "png"
+  | "gif"
+  | "bmp"
+  | "webp"
+  | "tiff"
+  | "tif"
+  | "ipynb"
+  | "epub"
+  | "md"
+  | "mbox"
+  | "csv"
+  | "xls"
+  | "xlsx"
+  | "mp3"
+  | "mp4"
+  | "txt"
+  | "xml";
 
 // New source state machine fields exposed by the backend.
 export type SourceStateValue = "UNCHANGED" | "NEW" | "MODIFIED" | "DELETED";
@@ -24,6 +59,7 @@ export type PendingActionValue = "NONE" | "CREATE" | "UPDATE" | "DELETE";
 
 export const DEFAULT_SCAN_TENANT_ID = "tenant-demo";
 export const FEISHU_APP_SETUP_STORAGE_KEY = "lazymind:datasource:feishu:app-setup";
+export const NOTION_APP_SETUP_STORAGE_KEY = "lazymind:datasource:notion:app-setup";
 export const FEISHU_DEFAULT_SCOPES = [
   "offline_access",
   "drive:drive",
@@ -34,14 +70,151 @@ export const FEISHU_DEFAULT_SCOPES = [
   "wiki:node:retrieve",
   "docx:document",
 ];
-export const FEISHU_INCLUDE_PATTERNS = [
-  "**/*.md",
-  "**/*.doc",
-  "**/*.docx",
-  "**/*.pdf",
-  "**/*.txt",
-];
 export const FEISHU_EXCLUDE_PATTERNS = ["**/~$*"];
+export const DATA_SOURCE_FILE_TYPE_OPTIONS: Array<{
+  value: DataSourceFileType;
+  extensions: string[];
+  i18nKey: string;
+}> = [
+  {
+    value: "pdf",
+    extensions: ["pdf"],
+    i18nKey: "admin.dataSourceFileTypePdf",
+  },
+  {
+    value: "doc",
+    extensions: ["doc"],
+    i18nKey: "admin.dataSourceFileTypeDoc",
+  },
+  {
+    value: "docx",
+    extensions: ["docx"],
+    i18nKey: "admin.dataSourceFileTypeDocx",
+  },
+  {
+    value: "hwp",
+    extensions: ["hwp"],
+    i18nKey: "admin.dataSourceFileTypeHwp",
+  },
+  {
+    value: "ppt",
+    extensions: ["ppt"],
+    i18nKey: "admin.dataSourceFileTypePpt",
+  },
+  {
+    value: "pptx",
+    extensions: ["pptx"],
+    i18nKey: "admin.dataSourceFileTypePptx",
+  },
+  {
+    value: "pptm",
+    extensions: ["pptm"],
+    i18nKey: "admin.dataSourceFileTypePptm",
+  },
+  {
+    value: "jpg",
+    extensions: ["jpg"],
+    i18nKey: "admin.dataSourceFileTypeJpg",
+  },
+  {
+    value: "jpeg",
+    extensions: ["jpeg"],
+    i18nKey: "admin.dataSourceFileTypeJpeg",
+  },
+  {
+    value: "png",
+    extensions: ["png"],
+    i18nKey: "admin.dataSourceFileTypePng",
+  },
+  {
+    value: "gif",
+    extensions: ["gif"],
+    i18nKey: "admin.dataSourceFileTypeGif",
+  },
+  {
+    value: "bmp",
+    extensions: ["bmp"],
+    i18nKey: "admin.dataSourceFileTypeBmp",
+  },
+  {
+    value: "webp",
+    extensions: ["webp"],
+    i18nKey: "admin.dataSourceFileTypeWebp",
+  },
+  {
+    value: "tiff",
+    extensions: ["tiff"],
+    i18nKey: "admin.dataSourceFileTypeTiff",
+  },
+  {
+    value: "tif",
+    extensions: ["tif"],
+    i18nKey: "admin.dataSourceFileTypeTif",
+  },
+  {
+    value: "ipynb",
+    extensions: ["ipynb"],
+    i18nKey: "admin.dataSourceFileTypeIpynb",
+  },
+  {
+    value: "epub",
+    extensions: ["epub"],
+    i18nKey: "admin.dataSourceFileTypeEpub",
+  },
+  {
+    value: "md",
+    extensions: ["md"],
+    i18nKey: "admin.dataSourceFileTypeMd",
+  },
+  {
+    value: "mbox",
+    extensions: ["mbox"],
+    i18nKey: "admin.dataSourceFileTypeMbox",
+  },
+  {
+    value: "csv",
+    extensions: ["csv"],
+    i18nKey: "admin.dataSourceFileTypeCsv",
+  },
+  {
+    value: "xls",
+    extensions: ["xls"],
+    i18nKey: "admin.dataSourceFileTypeXls",
+  },
+  {
+    value: "xlsx",
+    extensions: ["xlsx"],
+    i18nKey: "admin.dataSourceFileTypeXlsx",
+  },
+  {
+    value: "mp3",
+    extensions: ["mp3"],
+    i18nKey: "admin.dataSourceFileTypeMp3",
+  },
+  {
+    value: "mp4",
+    extensions: ["mp4"],
+    i18nKey: "admin.dataSourceFileTypeMp4",
+  },
+  {
+    value: "txt",
+    extensions: ["txt"],
+    i18nKey: "admin.dataSourceFileTypeTxt",
+  },
+  {
+    value: "xml",
+    extensions: ["xml"],
+    i18nKey: "admin.dataSourceFileTypeXml",
+  },
+];
+export const DEFAULT_DATA_SOURCE_FILE_TYPES: DataSourceFileType[] = [
+  "pdf",
+  "doc",
+  "docx",
+  "xls",
+  "xlsx",
+  "csv",
+];
 export const FEISHU_MAX_OBJECT_SIZE_BYTES = 209715200;
 export const CLOUD_SYNC_POLL_INTERVAL_MS = 2000;
 export const CLOUD_SYNC_TIMEOUT_MS = 120000;
@@ -108,6 +281,7 @@ export interface DataSourceItem {
   enabled: boolean;
   scopeMode: FileSyncMode;
   selectedFiles: string[];
+  fileTypes?: DataSourceFileType[];
   fileCandidates: FileCandidate[];
   logs: SyncLogItem[];
   warning?: string;
@@ -120,8 +294,8 @@ export interface DataSourceItem {
   rootPath?: string;
   targetRef?: string;
   targetRefs?: string[];
-  targetType?: FeishuTargetType;
-  targetTypes?: Record<string, FeishuTargetType>;
+  targetType?: CloudTargetType;
+  targetTypes?: Record<string, CloudTargetType>;
   authConnectionId?: string;
   datasetId?: string;
   bindingId?: string;
@@ -143,7 +317,8 @@ export interface SourceFormValues {
   region?: string;
   prefix?: string;
   target?: string | string[];
-  targetType?: FeishuTargetType;
+  targetType?: CloudTargetType;
+  fileTypes?: DataSourceFileType[];
   spaceKey?: string;
   scopes?: string[];
   syncMode?: SyncMode;
@@ -212,7 +387,7 @@ export interface DocumentStatusRow {
 }
 
 export function isCloudType(type?: SourceType) {
-  return type === "feishu";
+  return type === "feishu" || type === "notion";
 }
 
 function getStatusTokens(value?: string) {
@@ -238,6 +413,9 @@ export function normalizeDataSourceStatus(
   status?: string,
   watchEnabled?: boolean,
 ): SourceStatus {
+  if (hasStatusToken(status, ["delete", "deleted", "deleting", "removed"])) {
+    return "deleted";
+  }
   if (
     hasStatusToken(status, [
       "error",
@@ -363,7 +541,7 @@ export function normalizeDataSourceParseStatus(parseState?: string): DetailParse
       "pending parse",
     ])
   ) {
-    return "reindexing";
+    return "pending";
   }
   if (hasStatusToken(parseState, ["delete", "deleted", "remove", "removed"])) {
     return "deleted";
@@ -389,6 +567,8 @@ export function normalizeDataSourceParseStatus(parseState?: string): DetailParse
       "reindexing",
       "running",
       "pending",
+      "waiting",
+      "working",
       "queued",
       "processing",
       "parsing",
@@ -425,6 +605,9 @@ export function getSourceTypeTitle(type: SourceType, t: TFunction) {
   if (type === "feishu") {
     return t("admin.dataSourceTypeFeishu");
   }
+  if (type === "notion") {
+    return t("admin.dataSourceTypeNotion");
+  }
   return type;
 }
 
@@ -435,10 +618,16 @@ export function getSourceTypeDescription(type: SourceType, t: TFunction) {
   if (type === "feishu") {
     return t("admin.dataSourceTypeFeishuDesc");
   }
+  if (type === "notion") {
+    return t("admin.dataSourceTypeNotionDesc");
+  }
   return "";
 }
 
 export function getStatusMeta(status: SourceStatus, t: TFunction) {
+  if (status === "deleted") {
+    return { color: "default", text: t("common.delete") };
+  }
   if (status === "active") {
     return { color: "success", text: t("admin.dataSourceStatusActive") };
   }
@@ -535,6 +724,29 @@ export function formatBytes(bytes?: number) {
   }
 
   return `${value.toFixed(value >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+export function resolveStorageUsed(
+  summary?: Record<string, any>,
+  fallback?: string,
+) {
+  const bytes =
+    summary?.storage_bytes ??
+    summary?.storageBytes ??
+    summary?.storage_used_bytes ??
+    summary?.storageUsedBytes;
+
+  if (typeof bytes === "number") {
+    return formatBytes(bytes);
+  }
+
+  const parsedBytes =
+    typeof bytes === "string" && bytes.trim() ? Number(bytes) : Number.NaN;
+  if (Number.isFinite(parsedBytes)) {
+    return formatBytes(parsedBytes);
+  }
+
+  return fallback || "0 B";
 }
 
 // Source/sync state helpers below.

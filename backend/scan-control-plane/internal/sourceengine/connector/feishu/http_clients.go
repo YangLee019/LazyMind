@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"path"
@@ -41,7 +42,7 @@ func (c *HTTPAuthConnectionClient) GetToken(ctx context.Context, req TokenReques
 	}
 	var out Token
 	path := "/api/authservice/v1/cloud/connections/" + url.PathEscape(connectionID) + "/token"
-	if err := c.doAuthServiceJSON(ctx, endpoint(c.baseURL, path, authQuery(req.UserID, "")), &out); err != nil {
+	if err := c.doAuthServiceToken(ctx, endpoint(c.baseURL, path, authQuery(req.UserID, "")), &out); err != nil {
 		return Token{}, err
 	}
 	return out, nil
@@ -53,15 +54,123 @@ func (c *HTTPAuthConnectionClient) Verify(ctx context.Context, authConnectionID,
 		return connector.NewError(ErrorCodeAuthInvalid, "auth_connection_id is required")
 	}
 	path := "/api/authservice/v1/cloud/connections/" + url.PathEscape(connectionID) + "/verify"
-	return c.doAuthServiceJSON(ctx, endpoint(c.baseURL, path, authQuery(userID, tenantID)), nil)
+	return c.doAuthServiceRequest(ctx, endpoint(c.baseURL, path, authQuery(userID, tenantID)), http.MethodGet, nil, nil)
 }
 
-func (c *HTTPAuthConnectionClient) doAuthServiceJSON(ctx context.Context, url string, out *Token) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func (c *HTTPAuthConnectionClient) BatchStatus(ctx context.Context, req ConnectionStatusRequest) (map[string]ConnectionStatus, error) {
+	connectionIDs := uniqueNonEmptyStrings(req.ConnectionIDs)
+	if len(connectionIDs) == 0 {
+		return map[string]ConnectionStatus{}, nil
+	}
+	body, err := json.Marshal(map[string]any{"connection_ids": connectionIDs})
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Items []struct {
+			ConnectionID      string `json:"connection_id"`
+			TenantID          string `json:"tenant_id"`
+			OwnerUserID       string `json:"owner_user_id"`
+			Provider          string `json:"provider"`
+			AuthMode          string `json:"auth_mode"`
+			ProviderAccountID string `json:"provider_account_id"`
+			DisplayName       string `json:"display_name"`
+			ProviderTenantKey string `json:"provider_tenant_key"`
+			Status            string `json:"status"`
+			LastError         string `json:"last_error"`
+			LastUsedAt        string `json:"last_used_at"`
+			UpdatedAt         string `json:"updated_at"`
+		} `json:"items"`
+	}
+	path := "/api/authservice/v1/cloud/connections/status:batch"
+	if err := c.doAuthServiceRequest(ctx, endpoint(c.baseURL, path, authQuery(req.UserID, req.TenantID)), http.MethodPost, bytes.NewReader(body), &payload); err != nil {
+		return nil, err
+	}
+	statuses := make(map[string]ConnectionStatus, len(payload.Items))
+	for _, item := range payload.Items {
+		connectionID := strings.TrimSpace(item.ConnectionID)
+		if connectionID == "" {
+			continue
+		}
+		statuses[connectionID] = ConnectionStatus{
+			ConnectionID:      connectionID,
+			TenantID:          item.TenantID,
+			OwnerUserID:       item.OwnerUserID,
+			Provider:          item.Provider,
+			AuthMode:          item.AuthMode,
+			ProviderAccountID: item.ProviderAccountID,
+			DisplayName:       item.DisplayName,
+			ProviderTenantKey: item.ProviderTenantKey,
+			Status:            strings.ToUpper(strings.TrimSpace(item.Status)),
+			LastError:         item.LastError,
+			LastUsedAt:        item.LastUsedAt,
+			UpdatedAt:         item.UpdatedAt,
+		}
+	}
+	return statuses, nil
+}
+
+func (c *HTTPAuthConnectionClient) ListTargetCacheConnections(ctx context.Context, req ConnectionListRequest) ([]ConnectionStatus, error) {
+	query := url.Values{}
+	if provider := strings.TrimSpace(req.Provider); provider != "" {
+		query.Set("provider", provider)
+	}
+	if req.Limit > 0 {
+		query.Set("limit", strconv.Itoa(req.Limit))
+	}
+	var payload struct {
+		Items []struct {
+			ConnectionID      string `json:"connection_id"`
+			TenantID          string `json:"tenant_id"`
+			OwnerUserID       string `json:"owner_user_id"`
+			Provider          string `json:"provider"`
+			AuthMode          string `json:"auth_mode"`
+			ProviderAccountID string `json:"provider_account_id"`
+			DisplayName       string `json:"display_name"`
+			ProviderTenantKey string `json:"provider_tenant_key"`
+			Status            string `json:"status"`
+			LastError         string `json:"last_error"`
+			LastUsedAt        string `json:"last_used_at"`
+			UpdatedAt         string `json:"updated_at"`
+		} `json:"items"`
+	}
+	path := "/api/authservice/v1/cloud/connections/internal/target-cache-candidates"
+	if err := c.doAuthServiceRequest(ctx, endpoint(c.baseURL, path, query), http.MethodGet, nil, &payload); err != nil {
+		return nil, err
+	}
+	items := make([]ConnectionStatus, 0, len(payload.Items))
+	for _, item := range payload.Items {
+		connectionID := strings.TrimSpace(item.ConnectionID)
+		if connectionID == "" {
+			continue
+		}
+		items = append(items, ConnectionStatus{
+			ConnectionID:      connectionID,
+			TenantID:          item.TenantID,
+			OwnerUserID:       item.OwnerUserID,
+			Provider:          item.Provider,
+			AuthMode:          item.AuthMode,
+			ProviderAccountID: item.ProviderAccountID,
+			DisplayName:       item.DisplayName,
+			ProviderTenantKey: item.ProviderTenantKey,
+			Status:            strings.ToUpper(strings.TrimSpace(item.Status)),
+			LastError:         item.LastError,
+			LastUsedAt:        item.LastUsedAt,
+			UpdatedAt:         item.UpdatedAt,
+		})
+	}
+	return items, nil
+}
+
+func (c *HTTPAuthConnectionClient) doAuthServiceRequest(ctx context.Context, url, method string, body io.Reader, out any) error {
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if c.internalToken != "" {
 		req.Header.Set("X-LazyMind-Internal-Token", c.internalToken)
 	}
@@ -77,13 +186,34 @@ func (c *HTTPAuthConnectionClient) doAuthServiceJSON(ctx context.Context, url st
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
+	if err := decodeAuthServiceJSON(resp.Body, out); err != nil {
+		return err
+	}
+	return nil
+}
+
+func decodeAuthServiceJSON(r io.Reader, out any) error {
+	var raw json.RawMessage
+	if err := json.NewDecoder(r).Decode(&raw); err != nil {
+		return err
+	}
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err == nil && len(envelope.Data) > 0 && string(envelope.Data) != "null" {
+		return json.Unmarshal(envelope.Data, out)
+	}
+	return json.Unmarshal(raw, out)
+}
+
+func (c *HTTPAuthConnectionClient) doAuthServiceToken(ctx context.Context, url string, out *Token) error {
 	var payload struct {
 		AccessToken string `json:"access_token"`
 		Data        struct {
 			AccessToken string `json:"access_token"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := c.doAuthServiceRequest(ctx, url, http.MethodGet, nil, &payload); err != nil {
 		return err
 	}
 	out.AccessToken = strings.TrimSpace(firstNonEmpty(payload.AccessToken, payload.Data.AccessToken))
@@ -149,7 +279,7 @@ func (c *DefaultFeishuAPIClient) DownloadDriveFile(ctx context.Context, token, f
 	if err != nil {
 		return ExportedContent{}, err
 	}
-	return ExportedContent{Content: body, ExportedVersion: expectedVersion}, nil
+	return ExportedContent{Content: body, SizeBytes: int64(len(body)), ExportedVersion: expectedVersion}, nil
 }
 
 func (c *DefaultFeishuAPIClient) ExportDriveDocumentMarkdown(ctx context.Context, token, docToken, expectedVersion string) (ExportedContent, error) {
@@ -199,7 +329,7 @@ func (c *DefaultFeishuAPIClient) ListWikiChildren(ctx context.Context, token, sp
 	if err := doFeishuOpenAPIJSON(ctx, c.httpClient, endpoint(c.baseURL, path, query), http.MethodGet, token, nil, &out); err != nil {
 		return ObjectPage{}, err
 	}
-	return wikiNodesPage(out, spaceID), nil
+	return wikiNodesPage(out, spaceID, strings.TrimSpace(nodeToken)), nil
 }
 
 func (c *DefaultFeishuAPIClient) ExportWikiNodeMarkdown(ctx context.Context, token, spaceID, nodeToken, expectedVersion string) (ExportedContent, error) {
@@ -207,11 +337,25 @@ func (c *DefaultFeishuAPIClient) ExportWikiNodeMarkdown(ctx context.Context, tok
 	if err != nil {
 		return ExportedContent{}, err
 	}
-	objType := strings.ToLower(strings.TrimSpace(node.FileExtension))
+	objType := normalizedFeishuObjectType(firstNonEmpty(node.DriveType, node.FileExtension))
 	objToken := firstNonEmpty(node.StableID, node.Token)
-	if objType == ".doc" {
-		objType = "doc"
-	} else if objType == ".docx" || objType == "" {
+	if !isFeishuDocType(objType) && objType != "" && objType != "md" {
+		exported, err := c.DownloadDriveFile(ctx, token, objToken, expectedVersion)
+		if err != nil {
+			return ExportedContent{}, err
+		}
+		if exported.MimeType == "" {
+			exported.MimeType = node.MimeType
+		}
+		if exported.FileExtension == "" {
+			exported.FileExtension = node.FileExtension
+		}
+		if exported.SizeBytes == 0 {
+			exported.SizeBytes = node.SizeBytes
+		}
+		return exported, nil
+	}
+	if objType == "" || objType == "md" {
 		objType = "docx"
 	}
 	content, err := c.rawContent(ctx, token, objType, objToken)
@@ -268,6 +412,7 @@ type openAPIDriveFiles struct {
 	Files         []map[string]any `json:"files"`
 	NextPageToken string           `json:"next_page_token"`
 	PageToken     string           `json:"page_token"`
+	HasMore       *bool            `json:"has_more"`
 }
 
 type openAPIWikiSpaces struct {
@@ -275,7 +420,7 @@ type openAPIWikiSpaces struct {
 	Spaces        []map[string]any `json:"spaces"`
 	NextPageToken string           `json:"next_page_token"`
 	PageToken     string           `json:"page_token"`
-	HasMore       bool             `json:"has_more"`
+	HasMore       *bool            `json:"has_more"`
 }
 
 type openAPIWikiNodes struct {
@@ -283,7 +428,7 @@ type openAPIWikiNodes struct {
 	Nodes         []map[string]any `json:"nodes"`
 	NextPageToken string           `json:"next_page_token"`
 	PageToken     string           `json:"page_token"`
-	HasMore       bool             `json:"has_more"`
+	HasMore       *bool            `json:"has_more"`
 }
 
 func doFeishuOpenAPIJSON(ctx context.Context, client *http.Client, url, method, token string, in any, out any) error {
@@ -439,18 +584,20 @@ func driveObjectPage(data openAPIDriveFiles, parentToken string) ObjectPage {
 	for _, item := range data.Files {
 		items = append(items, driveObject(item, parentToken))
 	}
+	next := firstNonEmpty(data.NextPageToken, data.PageToken)
 	return ObjectPage{
 		Items:      items,
-		NextCursor: firstNonEmpty(data.NextPageToken, data.PageToken),
-		HasMore:    firstNonEmpty(data.NextPageToken, data.PageToken) != "",
+		NextCursor: next,
+		HasMore:    openAPIHasMore(data.HasMore, next),
 	}
 }
 
 func driveObject(item map[string]any, parentToken string) Object {
-	token := openAPIString(item["token"])
+	token := firstNonEmpty(openAPIString(item["token"]), openAPIString(item["file_token"]))
 	name := firstNonEmpty(openAPIString(item["name"]), token)
 	rawType := strings.ToLower(firstNonEmpty(openAPIString(item["type"]), openAPIString(item["file_type"])))
 	isFolder := rawType == "folder"
+	shortcutInfo, _ := item["shortcut_info"].(map[string]any)
 	modified := openAPIInt64(firstNonEmpty(
 		openAPIString(item["modified_time"]),
 		openAPIString(item["edit_time"]),
@@ -470,18 +617,20 @@ func driveObject(item map[string]any, parentToken string) Object {
 		token,
 	)
 	object := Object{
-		Kind:            ObjectKindDriveFile,
-		Token:           token,
-		ParentToken:     strings.TrimSpace(parentToken),
-		Name:            name,
-		IsDocument:      true,
-		Revision:        revision,
-		ModifiedUnixSec: modified,
-		SizeBytes:       openAPIInt64(item["size"]),
-		MimeType:        openAPIString(item["mime_type"]),
-		FileExtension:   openAPIString(item["file_extension"]),
-		DriveType:       rawType,
-		StableID:        token,
+		Kind:                ObjectKindDriveFile,
+		Token:               token,
+		ParentToken:         firstNonEmpty(strings.TrimSpace(parentToken), openAPIString(item["parent_token"]), openAPIString(item["parent_folder_token"])),
+		Name:                name,
+		IsDocument:          true,
+		Revision:            revision,
+		ModifiedUnixSec:     modified,
+		SizeBytes:           openAPIInt64(item["size"]),
+		MimeType:            openAPIString(item["mime_type"]),
+		FileExtension:       openAPIString(item["file_extension"]),
+		DriveType:           rawType,
+		ShortcutTargetType:  strings.ToLower(openAPIString(shortcutInfo["target_type"])),
+		ShortcutTargetToken: openAPIString(shortcutInfo["target_token"]),
+		StableID:            token,
 	}
 	if isFolder {
 		object.Kind = ObjectKindDriveFolder
@@ -513,28 +662,45 @@ func wikiSpacesPage(data openAPIWikiSpaces) ObjectPage {
 		})
 	}
 	next := firstNonEmpty(data.NextPageToken, data.PageToken)
-	return ObjectPage{Items: items, NextCursor: next, HasMore: data.HasMore || next != ""}
+	return ObjectPage{Items: items, NextCursor: next, HasMore: openAPIHasMore(data.HasMore, next)}
 }
 
-func wikiNodesPage(data openAPIWikiNodes, spaceID string) ObjectPage {
+func wikiNodesPage(data openAPIWikiNodes, spaceID, parentNodeToken string) ObjectPage {
 	nodes := data.Items
 	if len(nodes) == 0 {
 		nodes = data.Nodes
 	}
 	items := make([]Object, 0, len(nodes))
 	for _, node := range nodes {
-		items = append(items, wikiNodeObject(node, spaceID, ""))
+		items = append(items, wikiNodeObjectWithParent(node, spaceID, "", parentNodeToken))
 	}
 	next := firstNonEmpty(data.NextPageToken, data.PageToken)
-	return ObjectPage{Items: items, NextCursor: next, HasMore: data.HasMore || next != ""}
+	return ObjectPage{Items: items, NextCursor: next, HasMore: openAPIHasMore(data.HasMore, next)}
+}
+
+func openAPIHasMore(hasMore *bool, nextCursor string) bool {
+	if hasMore != nil {
+		return *hasMore
+	}
+	return strings.TrimSpace(nextCursor) != ""
 }
 
 func wikiNodeObject(node map[string]any, spaceID, fallbackToken string) Object {
+	return wikiNodeObjectWithParent(node, spaceID, fallbackToken, "")
+}
+
+func wikiNodeObjectWithParent(node map[string]any, spaceID, fallbackToken, fallbackParentToken string) Object {
 	nodeToken := firstNonEmpty(openAPIString(node["node_token"]), openAPIString(node["token"]), fallbackToken)
 	resolvedSpaceID := firstNonEmpty(openAPIString(node["space_id"]), spaceID)
 	objType := strings.ToLower(openAPIString(node["obj_type"]))
 	objToken := openAPIString(node["obj_token"])
 	hasChild := openAPIBool(node["has_child"])
+	name := firstNonEmpty(openAPIString(node["title"]), openAPIString(node["node_title"]), openAPIString(node["name"]), openAPIString(node["obj_name"]), nodeToken)
+	fileExtension := wikiNodeFileExtension(name, objType, node)
+	mimeType := ""
+	if !isFeishuDocType(objType) {
+		mimeType = wikiNodeMimeType(fileExtension, node)
+	}
 	modified := openAPIInt64(firstNonEmpty(
 		openAPIString(node["obj_edit_time"]),
 		openAPIString(node["update_time"]),
@@ -544,19 +710,53 @@ func wikiNodeObject(node map[string]any, spaceID, fallbackToken string) Object {
 		openAPIString(node["obj_update_time"]),
 	))
 	return Object{
-		Kind:            ObjectKindWikiNode,
-		Token:           nodeToken,
-		ParentToken:     openAPIString(node["parent_node_token"]),
-		SpaceID:         resolvedSpaceID,
-		Name:            firstNonEmpty(openAPIString(node["title"]), openAPIString(node["node_title"]), openAPIString(node["name"]), openAPIString(node["obj_name"]), nodeToken),
-		IsDocument:      true,
-		IsContainer:     hasChild || objType == "folder" || objType == "wiki" || objType == "space",
-		HasChildren:     hasChild,
-		Revision:        firstNonEmpty(openAPIString(node["obj_edit_time"]), openAPIString(node["update_time"]), openAPIString(node["edit_time"]), nodeToken),
+		Kind:        ObjectKindWikiNode,
+		Token:       nodeToken,
+		ParentToken: firstNonEmpty(openAPIString(node["parent_node_token"]), strings.TrimSpace(fallbackParentToken)),
+		SpaceID:     resolvedSpaceID,
+		Name:        name,
+		IsDocument:  true,
+		IsContainer: hasChild || objType == "folder" || objType == "wiki" || objType == "space",
+		HasChildren: hasChild,
+		Revision: firstNonEmpty(
+			openAPIString(node["obj_edit_time"]),
+			openAPIString(node["update_time"]),
+			openAPIString(node["edit_time"]),
+			openAPIString(node["modified_time"]),
+			openAPIString(node["node_update_time"]),
+			openAPIString(node["obj_update_time"]),
+			nodeToken,
+		),
 		ModifiedUnixSec: modified,
-		FileExtension:   "." + firstNonEmpty(objType, "docx"),
+		SizeBytes:       openAPIInt64(firstNonEmpty(openAPIString(node["size"]), openAPIString(node["obj_size"]), openAPIString(node["file_size"]))),
+		MimeType:        mimeType,
+		FileExtension:   fileExtension,
+		DriveType:       objType,
 		StableID:        objToken,
 	}
+}
+
+func wikiNodeFileExtension(name, objType string, node map[string]any) string {
+	if extension := openAPIString(node["file_extension"]); extension != "" {
+		if strings.HasPrefix(extension, ".") {
+			return extension
+		}
+		return "." + extension
+	}
+	if objType == "file" {
+		return path.Ext(name)
+	}
+	if objType == "" {
+		return ".docx"
+	}
+	return "." + objType
+}
+
+func wikiNodeMimeType(fileExtension string, node map[string]any) string {
+	if mimeType := openAPIString(node["mime_type"]); mimeType != "" {
+		return mimeType
+	}
+	return mime.TypeByExtension(fileExtension)
 }
 
 func openAPIMapValue(v any, fallback map[string]any) map[string]any {
@@ -660,6 +860,9 @@ func mapFeishuOpenAPIError(code, message string, statusCode int) error {
 	if strings.TrimSpace(message) == "" {
 		message = "feishu api request failed"
 	}
+	if statusCode == http.StatusTooManyRequests || isFeishuRateLimitMessage(message) {
+		return connector.NewError(connector.ErrorCodeRateLimited, message)
+	}
 	switch code {
 	case "connection_not_found", "token_expired", "refresh_failed", "auth_invalid":
 		return connector.NewError(ErrorCodeAuthInvalid, message)
@@ -681,6 +884,13 @@ func mapFeishuOpenAPIError(code, message string, statusCode int) error {
 		}
 		return connector.NewError(connector.ErrorCodeTransient, message)
 	}
+}
+
+func isFeishuRateLimitMessage(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(message, "frequency limit") ||
+		strings.Contains(message, "rate limit") ||
+		strings.Contains(message, "too many requests")
 }
 
 func isHTMLResponse(contentType string, body []byte) bool {

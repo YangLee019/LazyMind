@@ -1,8 +1,9 @@
 from typing import Any, Dict, List, Optional
 
 import lazyllm
-from lazyllm import AutoModel
+from lazyllm import AutoModel, LOG
 from lazyllm.tools.rag import Reranker, Retriever, TempDocRetriever
+from lazyllm.tools.rag.doc_impl import NodeGroupType
 
 from lazymind.chat.engine.tools.infra import handle_tool_errors, tool_success
 from lazymind.chat.engine.tools._utils import (
@@ -11,12 +12,11 @@ from lazymind.chat.engine.tools._utils import (
     parse_number_range,
     truncate_text,
 )
-from lazymind.chat.engine.tools.algo import search_kb
+from lazymind.chat.engine.tools.algo import DOCUMENT, search_kb, search_temp_files
 from lazymind.chat.engine.tools.infra import (
-    opensearch_search,
     resolve_index,
-    term_filter,
 )
+from lazymind.parsing.engine.transform import GeneralParser
 from lazymind.chat.service.utils import (
     annotate_citations,
     basename_from_path,
@@ -28,9 +28,6 @@ from lazymind.model_config import get_dynamic_role_slot_map
 
 _MAX_TEXT_LEN = 1200
 _MAX_RESULT_ITEMS = 50
-_DEFAULT_KB_URL = _cfg['agentic_kb_url']
-_DEFAULT_KB_NAME = _cfg['agentic_kb_name']
-_DEFAULT_KB_DOCUMENT = lazyllm.Document(url=f'{_DEFAULT_KB_URL}/_call', name=_DEFAULT_KB_NAME)
 
 
 def build_default_retriever_configs() -> List[dict]:
@@ -124,22 +121,26 @@ def _serialize_doc_node_like(node: Any) -> Dict[str, Any]:
     return serialized
 
 
-def _source_to_result(hit: Dict[str, Any]) -> Dict[str, Any]:
-    src = hit.get('_source') or {}
-    meta = parse_json_dict(src.get('meta'))
-    global_meta = parse_json_dict(src.get('global_meta'))
+def _store_dict_to_result(d: Dict[str, Any]) -> Dict[str, Any]:
+    meta = d.get('meta', {})
+    if isinstance(meta, str):
+        meta = parse_json_dict(meta)
+    global_meta = d.get('global_meta', {})
+    if isinstance(global_meta, str):
+        global_meta = parse_json_dict(global_meta)
     return {
-        'uid': src.get('uid') or hit.get('_id'),
-        'number': src.get('number'),
-        'group': src.get('group'),
-        'parent': src.get('parent'),
-        'docid': src.get('doc_id') or global_meta.get('docid'),
-        'kb_id': src.get('kb_id') or global_meta.get('kb_id'),
-        'score': hit.get('_score'),
-        'text': truncate_text(src.get('content'), _MAX_TEXT_LEN),
+        'uid': d.get('uid'),
+        'number': d.get('number'),
+        'group': d.get('group'),
+        'parent': d.get('parent'),
+        'score': d.get('score'),
+        'text': truncate_text(d.get('content', '') or '', _MAX_TEXT_LEN),
+        'docid': d.get('doc_id') or global_meta.get('docid'),
+        'kb_id': d.get('kb_id') or global_meta.get('kb_id'),
+        'file_name': global_meta.get('file_name'),
         'metadata': meta,
         'global_metadata': global_meta,
-        'highlight': hit.get('highlight', {}).get('content', []),
+        'highlights': d.get('highlights', []),
     }
 
 
@@ -191,8 +192,8 @@ def _annotate_result_citations(result: Any) -> Any:
 
 
 class KBToolGroup:
+    """Knowledge base search and navigation tools."""
     __public_apis__ = ['kb_search', 'kb_get_parent_node', 'kb_get_window_nodes', 'kb_keyword_search']
-    _document = None
     _retrievers = None
     _reranker = None
     _image_retriever = None
@@ -203,11 +204,10 @@ class KBToolGroup:
 
     def _ensure_search_runtime(self) -> None:
         cls = type(self)
-        if cls._document is not None:
+        if cls._retrievers is not None:
             return
-        cls._document = _DEFAULT_KB_DOCUMENT
         cls._retrievers = [
-            Retriever(cls._document, **cfg)
+            Retriever(DOCUMENT, **cfg)
             for cfg in build_default_retriever_configs()
         ]
         cls._reranker = (
@@ -216,7 +216,7 @@ class KBToolGroup:
             else None
         )
         cls._image_retriever = Retriever(
-            cls._document,
+            DOCUMENT,
             group_name='image',
             embed_keys=[EMBED_IMAGE],
         )
@@ -233,11 +233,18 @@ class KBToolGroup:
     ) -> Any:
         """Search the knowledge base and return text and image retrieval results.
 
-        Text retrieval and image retrieval run simultaneously. The final result
-        is the concatenation of text nodes and image nodes.
+        IMPORTANT: Each call handles exactly ONE search intent. If the user asks
+        about multiple unrelated keywords or topics, you MUST call this tool
+        separately for each keyword/topic — do NOT combine unrelated terms into
+        one query with spaces, commas, or list-like text.
+
+        For example, if the user asks "What is the difference between Redis and
+        Kafka?", call this tool twice: once with query="Redis" and once with
+        query="Kafka", rather than a single call with query="Redis Kafka".
 
         Args:
-            query: Natural language query text used for retrieval.
+            query: A SINGLE natural language query for retrieval. Do NOT put
+                multiple unrelated keywords in this field.
             retriever_topk: Candidate count used by each retriever route before
                 fusion. Defaults to 20.
             rerank_topk: Number of nodes the reranker keeps before adaptive-k
@@ -249,19 +256,18 @@ class KBToolGroup:
         """
         agentic_config = lazyllm.globals['agentic_config']
         self._ensure_search_runtime()
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError('query is required and must be a non-empty string')
 
         payload = {
-            'query': query,
+            'query': query.strip(),
             'filters': filters or agentic_config.get('filters') or {},
-            'files': [],
             'user_id': agentic_config.get('user_id', ''),
         }
 
         result = search_kb(
             payload,
-            document=type(self)._document,
             retrievers=type(self)._retrievers,
-            tmp_retriever=None,
             reranker=type(self)._reranker,
             image_retriever=type(self)._image_retriever,
             retriever_topk=retriever_topk or 20,
@@ -278,10 +284,14 @@ class KBToolGroup:
 
     @handle_tool_errors
     def kb_get_parent_node(self, node_id: str) -> Dict[str, Any]:
-        """Get the parent node of a target node by document node uid.
+        """Get the parent node of a target document node.
+
+        Retrieves the parent node (e.g., section heading or enclosing
+        paragraph) for a given chunk node. This provides the section-level
+        context needed to fully understand the chunk's content.
 
         Args:
-            node_id: Target document node ``uid``.
+            node_id: Target document node uid.
 
         Returns:
             The matched parent node, if the current node has a parent and the
@@ -291,7 +301,7 @@ class KBToolGroup:
             raise ValueError('node_id is required')
 
         config = lazyllm.globals['agentic_config']
-        doc = _DEFAULT_KB_DOCUMENT
+        doc = DOCUMENT
 
         for kb_id in iter_lookup_ids(
             (config.get('filters') or {}).get('kb_id'),
@@ -345,14 +355,18 @@ class KBToolGroup:
         number: Any,
         group: str = 'block',
     ) -> Dict[str, Any]:
-        """Get nodes by number in a target document using LazyLLM Document.
+        """Get nodes by number range from a target document.
+
+        Retrieves one or more neighboring nodes around a specific position
+        within a known document. This provides surrounding context for a
+        node whose docid and number are already known.
 
         Args:
             docid: Target document id.
             number: Node number or inclusive number range. Pass an int for one
-                node, or ``[start, end]`` / ``"start,end"`` for all nodes in that
+                node, or [start, end] / "start,end" for all nodes in that
                 range.
-            group: Node group, either ``block`` or ``line``.
+            group: Node group, either block or line.
 
         Returns:
             A compact dict with node numbers and contents only.
@@ -369,7 +383,7 @@ class KBToolGroup:
             raise ValueError(f'number range cannot exceed {_MAX_RESULT_ITEMS} nodes')
 
         config = lazyllm.globals['agentic_config']
-        doc = _DEFAULT_KB_DOCUMENT
+        doc = DOCUMENT
 
         for kb_id in iter_lookup_ids(
             (config.get('filters') or {}).get('kb_id'),
@@ -412,19 +426,23 @@ class KBToolGroup:
         size: int = 10,
         sort_by: str = 'score',
     ) -> Dict[str, Any]:
-        """Search a keyword inside one target document in OpenSearch.
+        """Search for exact keyword or phrase matches within a specific document.
+
+        Performs full-text keyword matching inside one target document,
+        useful for finding all occurrences of a term or checking whether a
+        document mentions something specific.
 
         Args:
-            keyword: Keyword or phrase to search in ``content``.
+            keyword: Keyword or phrase to search in content.
             docid: Target document id.
-            group: Search granularity, either ``block`` or ``line``.
-            phrase: Use ``match_phrase`` when true, otherwise ``match``.
+            group: Search granularity, either block or line.
+            phrase: Use match_phrase when true, otherwise match.
             size: Maximum number of hits.
-            sort_by: ``score`` for relevance first, or ``number`` for document
+            sort_by: score for relevance first, or number for document
                 order.
 
         Returns:
-            Matching nodes with content snippets and OpenSearch highlights.
+            Matching nodes with content snippets.
         """
         if not keyword:
             raise ValueError('keyword is required')
@@ -432,71 +450,44 @@ class KBToolGroup:
             raise ValueError('docid is required')
 
         config = lazyllm.globals['agentic_config']
-        size = max(1, min(int(size), _MAX_RESULT_ITEMS))
-        text_query = {'match_phrase' if phrase else 'match': {'content': keyword}}
-        sort = [{'number': {'order': 'asc'}}] if sort_by == 'number' else [
-            {'_score': {'order': 'desc'}},
-            {'number': {'order': 'asc'}},
-        ]
         index_name = resolve_index(group)
+        size = max(1, min(int(size), _MAX_RESULT_ITEMS))
+        doc = DOCUMENT
+        LOG.info(f'[kb_keyword_search] store={_cfg["segment_store_type"]!r} keyword={keyword!r} docid={docid!r} '
+                 f'group={group!r} phrase={phrase} sort_by={sort_by!r} size={size}')
+
         for kb_id in iter_lookup_ids(
             (config.get('filters') or {}).get('kb_id'),
             field_name='agentic_config.filters.kb_id',
         ):
-            filters = [term_filter('doc_id', docid)]
-            if kb_id:
-                filters.insert(0, term_filter('kb_id', kb_id))
-            body = {
-                'size': size,
-                '_source': [
-                    'uid', 'doc_id', 'kb_id', 'group', 'content', 'meta',
-                    'global_meta', 'type', 'number', 'parent',
-                ],
-                'query': {
-                    'bool': {
-                        'filter': filters,
-                        'must': [text_query],
-                    }
-                },
-                'sort': sort,
-                'highlight': {
-                    'fields': {
-                        'content': {
-                            'fragment_size': 180,
-                            'number_of_fragments': 3,
-                        }
-                    }
-                },
-            }
-            hits = opensearch_search(index_name, body).get('hits', {}).get('hits', [])
-            if not hits:
+            LOG.info(f'[kb_keyword_search] trying kb_id={kb_id!r}')
+            nodes = doc.keyword_search(
+                group=group, keyword=keyword, doc_id=docid,
+                kb_id=kb_id, phrase=phrase, sort_by=sort_by, size=size,
+            )
+            LOG.info(f'[kb_keyword_search] doc.keyword_search returned {len(nodes)} nodes')
+            if not nodes:
                 continue
             result = {
                 'index': index_name,
                 'group': group,
                 'docid': docid,
                 'keyword': keyword,
-                'total': len(hits),
-                'items': [_source_to_result(hit) for hit in hits],
+                'total': len(nodes),
+                'items': [_store_dict_to_result(n) for n in nodes],
             }
             _annotate_result_citations(result)
             return tool_success('kb_keyword_search', result)
 
-        result = {
-            'index': index_name,
-            'group': group,
-            'docid': docid,
-            'keyword': keyword,
-            'total': 0,
-            'items': [],
-        }
-        _annotate_result_citations(result)
-        return tool_success('kb_keyword_search', result)
+        return tool_success('kb_keyword_search', {
+            'index': index_name, 'group': group, 'docid': docid,
+            'keyword': keyword, 'total': 0, 'items': [],
+        })
 
 
 class TempKBToolGroup:
+    """Temporary file search tools."""
     __public_apis__ = ['kb_tmp_search']
-    _document = None
     _tmp_retriever = None
     _reranker = None
 
@@ -508,8 +499,13 @@ class TempKBToolGroup:
         cls = type(self)
         if cls._tmp_retriever is not None:
             return
-        cls._document = _DEFAULT_KB_DOCUMENT
         cls._tmp_retriever = TempDocRetriever(embed=AutoModel(model=EMBED_MAIN))
+        cls._tmp_retriever.create_node_group(
+            name='block',
+            display_name='paragraph slice',
+            group_type=NodeGroupType.CHUNK,
+            transform=GeneralParser(max_length=2048, split_by='\n'),
+        )
         cls._tmp_retriever.add_subretriever('block')
         cls._reranker = (
             Reranker('ModuleReranker', model=AutoModel(model='reranker'))
@@ -528,31 +524,35 @@ class TempKBToolGroup:
     ) -> Any:
         """Search temporary uploaded files with the temporary document retriever.
 
+        Each call handles exactly one search intent. If the user asks about
+        multiple unrelated keywords or topics, call this tool separately for
+        each keyword/topic. Do not combine unrelated terms into one query
+        with spaces, commas, or list-like text.
+
         Args:
-            query: Natural language query text used for retrieval.
-            retriever_topk: Candidate count used by the temporary retriever.
-                Defaults to 20.
+            query: A single natural language query for retrieval.
+            retriever_topk: Candidate count used by the temporary retriever
+                before reranking. Defaults to 20.
             rerank_topk: Number of nodes the reranker keeps before adaptive-k
                 trimming. Defaults to 20.
             k_max: Hard upper bound on the adaptive-k stage. Defaults to 10.
             files: Optional list of temporary file IDs. Defaults to the current
-                request's ``agentic_config.files``.
+                request's agentic_config.files.
         """
         agentic_config = lazyllm.globals['agentic_config']
         self._ensure_search_runtime()
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError('query is required and must be a non-empty string')
         payload = {
-            'query': query,
+            'query': query.strip(),
             'filters': {},
             'files': files,
             'user_id': agentic_config.get('user_id', ''),
         }
-        result = search_kb(
+        result = search_temp_files(
             payload,
-            document=type(self)._document,
-            retrievers=[],
             tmp_retriever=type(self)._tmp_retriever,
             reranker=type(self)._reranker,
-            image_retriever=None,
             retriever_topk=retriever_topk or 20,
             rerank_topk=rerank_topk or 20,
             k_max=k_max or 10,

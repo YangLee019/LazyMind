@@ -24,17 +24,42 @@ func (e *DBSourceTreeQueryEngine) ListChildren(ctx context.Context, req SourceTr
 	if err != nil {
 		return TreeNodePage{}, mapStoreError(err)
 	}
-	if !req.UseCache {
+	if sourceTreeRootRequest(req) {
+		roots, ok, err := e.maybeListBindingRoots(ctx, req.SourceID)
+		if err != nil {
+			return TreeNodePage{}, err
+		}
+		if ok {
+			return roots, nil
+		}
+	}
+	binding, switchedBinding, err := e.resolveBindingForRequestedParent(ctx, req, binding)
+	if err != nil {
+		return TreeNodePage{}, err
+	}
+	if switchedBinding {
+		req.BindingID = binding.BindingID
+	}
+	if !sourceTreeUseCache(req) {
 		return e.listLiveChildren(ctx, req, binding, listMode)
 	}
 	treeKey := req.TreeKey
-	if treeKey == "" {
+	if treeKey == "" || switchedBinding {
 		treeKey = binding.TreeKey
 	}
 	parentKey := effectiveSourceParentKey(req, binding)
 	pageSize := normalizePageSize(req.PageSize, e.limits)
 	if listMode == ListModeAllCurrentLevel {
 		pageSize = req.MaxItems + 1
+	}
+	if shouldExpandBindingRoot(req, binding, parentKey) {
+		root, ok, err := e.indexedBindingRoot(ctx, req, binding)
+		if err != nil {
+			return TreeNodePage{}, err
+		}
+		if ok {
+			return objectPage([]ObjectWithState{root}, "", false, true), nil
+		}
 	}
 	items, nextCursor, hasMore, err := e.listObjects(ctx, req, treeKey, parentKey, pageSize)
 	if err != nil {
@@ -61,21 +86,6 @@ func (e *DBSourceTreeQueryEngine) listLiveChildren(ctx context.Context, req Sour
 		return TreeNodePage{}, mapConnectorError(err)
 	}
 	pageSize := normalizePageSize(req.PageSize, sourceLiveLimits(e.limits, conn.Spec()))
-	rawPage, err := conn.ListChildren(ctx, connector.ListChildrenRequest{
-		TargetType:       connector.TargetType(binding.TargetType),
-		TargetRef:        binding.TargetRef,
-		NodeRef:          liveSourceNodeRef(req, binding),
-		ListMode:         connector.ListMode(listMode),
-		Cursor:           req.Cursor,
-		PageSize:         pageSize,
-		MaxItems:         req.MaxItems,
-		AgentID:          binding.AgentID,
-		AuthConnectionID: binding.AuthConnectionID,
-		ProviderOptions:  liveSourceProviderOptions(binding.ProviderOptions, req.ProviderOptions),
-	})
-	if err != nil {
-		return TreeNodePage{}, mapConnectorError(err)
-	}
 	if shouldFetchLiveBindingRoot(req, binding) {
 		rootPage, err := conn.FetchPage(ctx, connector.FetchPageRequest{
 			SourceID:          req.SourceID,
@@ -94,12 +104,31 @@ func (e *DBSourceTreeQueryEngine) listLiveChildren(ctx context.Context, req Sour
 			return TreeNodePage{}, mapConnectorError(err)
 		}
 		if len(rootPage.Items) > 0 {
-			rawPage.Items = rootPage.Items[:1]
-			rawPage.NextCursor = ""
-			rawPage.HasMore = false
-			rawPage.ListComplete = true
+			return e.mapLiveSourcePage(ctx, conn, req, binding, connector.RawObjectPage{
+				Items:        rootPage.Items[:1],
+				ListComplete: true,
+			})
 		}
 	}
+	rawPage, err := conn.ListChildren(ctx, connector.ListChildrenRequest{
+		TargetType:       connector.TargetType(binding.TargetType),
+		TargetRef:        binding.TargetRef,
+		NodeRef:          liveSourceNodeRef(req, binding),
+		ListMode:         connector.ListMode(listMode),
+		Cursor:           req.Cursor,
+		PageSize:         pageSize,
+		MaxItems:         req.MaxItems,
+		AgentID:          binding.AgentID,
+		AuthConnectionID: binding.AuthConnectionID,
+		ProviderOptions:  liveSourceProviderOptions(binding.ProviderOptions, req.ProviderOptions),
+	})
+	if err != nil {
+		return TreeNodePage{}, mapConnectorError(err)
+	}
+	return e.mapLiveSourcePage(ctx, conn, req, binding, rawPage)
+}
+
+func (e *DBSourceTreeQueryEngine) mapLiveSourcePage(ctx context.Context, conn connector.SourceConnector, req SourceTreeChildrenRequest, binding store.Binding, rawPage connector.RawObjectPage) (TreeNodePage, error) {
 	nodes := make([]TreeNode, 0, len(rawPage.Items))
 	for _, raw := range rawPage.Items {
 		normalized, err := conn.MapObject(ctx, raw)
@@ -123,6 +152,54 @@ func (e *DBSourceTreeQueryEngine) listLiveChildren(ctx context.Context, req Sour
 	}, nil
 }
 
+type sourceObjectReader interface {
+	GetObject(ctx context.Context, sourceID, bindingID, objectKey string) (store.SourceObject, error)
+}
+
+type sourceDocumentStateReader interface {
+	GetDocumentState(ctx context.Context, sourceID, bindingID, objectKey string) (store.DocumentState, error)
+}
+
+func (e *DBSourceTreeQueryEngine) indexedBindingRoot(ctx context.Context, req SourceTreeChildrenRequest, binding store.Binding) (ObjectWithState, bool, error) {
+	reader, ok := e.repo.(sourceObjectReader)
+	if !ok || strings.TrimSpace(binding.TreeKey) == "" {
+		return ObjectWithState{}, false, nil
+	}
+	root, err := reader.GetObject(ctx, req.SourceID, binding.BindingID, binding.TreeKey)
+	if err != nil {
+		if store.ErrorCodeOf(err) == store.ErrCodeNotFound {
+			return ObjectWithState{}, false, nil
+		}
+		return ObjectWithState{}, false, mapStoreError(err)
+	}
+	if !root.HasChildren {
+		children, _, hasMore, err := e.listObjects(ctx, SourceTreeChildrenRequest{
+			SourceID:          req.SourceID,
+			BindingID:         binding.BindingID,
+			IncludeDocuments:  true,
+			IncludeContainers: true,
+		}, binding.TreeKey, root.ObjectKey, 1)
+		if err != nil {
+			return ObjectWithState{}, false, mapStoreError(err)
+		}
+		root.HasChildren = hasMore || len(children) > 0
+	}
+	item := ObjectWithState{Object: root}
+	if root.IsDocument {
+		if stateReader, ok := e.repo.(sourceDocumentStateReader); ok {
+			state, err := stateReader.GetDocumentState(ctx, req.SourceID, binding.BindingID, root.ObjectKey)
+			if err != nil {
+				if store.ErrorCodeOf(err) != store.ErrCodeNotFound {
+					return ObjectWithState{}, false, mapStoreError(err)
+				}
+			} else {
+				item.State = &state
+			}
+		}
+	}
+	return item, true, nil
+}
+
 func (e *DBSourceTreeQueryEngine) listObjects(ctx context.Context, req SourceTreeChildrenRequest, treeKey, parentKey string, pageSize int) ([]ObjectWithState, string, bool, error) {
 	return e.repo.ListObjects(ctx, store.ObjectListRequest{
 		SourceID:          req.SourceID,
@@ -142,11 +219,71 @@ func (e *DBSourceTreeQueryEngine) listBindingRoots(ctx context.Context, sourceID
 	if err != nil {
 		return TreeNodePage{}, mapStoreError(err)
 	}
+	return bindingRootsPage(bindings), nil
+}
+
+func bindingRootsPage(bindings []store.Binding) TreeNodePage {
 	nodes := make([]TreeNode, 0, len(bindings))
 	for _, binding := range bindings {
 		nodes = append(nodes, bindingRootNode(binding))
 	}
-	return TreeNodePage{Items: nodes, ListComplete: true}, nil
+	return TreeNodePage{Items: nodes, ListComplete: true}
+}
+
+func (e *DBSourceTreeQueryEngine) maybeListBindingRoots(ctx context.Context, sourceID string) (TreeNodePage, bool, error) {
+	bindings, err := e.repo.ListBindings(ctx, sourceID)
+	if err != nil {
+		return TreeNodePage{}, false, mapStoreError(err)
+	}
+	if len(bindings) <= 1 {
+		return TreeNodePage{}, false, nil
+	}
+	return bindingRootsPage(bindings), true, nil
+}
+
+func (e *DBSourceTreeQueryEngine) resolveBindingForRequestedParent(ctx context.Context, req SourceTreeChildrenRequest, fallback store.Binding) (store.Binding, bool, error) {
+	refs := requestedParentRefs(req)
+	if len(refs) == 0 {
+		return fallback, false, nil
+	}
+	bindings, err := e.repo.ListBindings(ctx, req.SourceID)
+	if err != nil {
+		return store.Binding{}, false, mapStoreError(err)
+	}
+	if len(bindings) <= 1 {
+		return fallback, false, nil
+	}
+	reader, hasReader := e.repo.(sourceObjectReader)
+	for _, binding := range bindings {
+		for _, ref := range refs {
+			objectKey := normalizeSourceNodeKey(ref, binding)
+			if objectKey == "" {
+				continue
+			}
+			if objectKey == binding.TreeKey {
+				return binding, binding.BindingID != fallback.BindingID, nil
+			}
+			if !hasReader {
+				continue
+			}
+			if _, err := reader.GetObject(ctx, req.SourceID, binding.BindingID, objectKey); err == nil {
+				return binding, binding.BindingID != fallback.BindingID, nil
+			} else if store.ErrorCodeOf(err) != store.ErrCodeNotFound {
+				return store.Binding{}, false, mapStoreError(err)
+			}
+		}
+	}
+	return fallback, false, nil
+}
+
+func requestedParentRefs(req SourceTreeChildrenRequest) []string {
+	refs := make([]string, 0, 4)
+	for _, ref := range []string{req.ParentKey, req.NodeRef, req.ParentRef, req.Key} {
+		if trimmed := strings.TrimSpace(ref); trimmed != "" {
+			refs = append(refs, trimmed)
+		}
+	}
+	return refs
 }
 
 func defaultSourceTreeIncludes(req SourceTreeChildrenRequest) SourceTreeChildrenRequest {
@@ -155,6 +292,21 @@ func defaultSourceTreeIncludes(req SourceTreeChildrenRequest) SourceTreeChildren
 		req.IncludeContainers = true
 	}
 	return req
+}
+
+func sourceTreeUseCache(req SourceTreeChildrenRequest) bool {
+	if req.UseCache == nil {
+		return true
+	}
+	return *req.UseCache
+}
+
+func sourceTreeRootRequest(req SourceTreeChildrenRequest) bool {
+	return strings.TrimSpace(req.ParentKey) == "" &&
+		strings.TrimSpace(req.NodeRef) == "" &&
+		strings.TrimSpace(req.ParentRef) == "" &&
+		strings.TrimSpace(req.Key) == "" &&
+		strings.TrimSpace(req.Cursor) == ""
 }
 
 func objectPage(items []ObjectWithState, nextCursor string, hasMore bool, listComplete bool) TreeNodePage {
@@ -208,6 +360,9 @@ func liveSourceNodeRef(req SourceTreeChildrenRequest, binding store.Binding) str
 
 func normalizeLiveSourceNodeRef(value string, binding store.Binding) string {
 	value = normalizeSourceNodeKey(value, binding)
+	if binding.ConnectorType == "feishu" && strings.HasPrefix(value, "feishu:wiki:space:") {
+		return value
+	}
 	if binding.ConnectorType == "feishu" && strings.HasPrefix(value, "feishu:") {
 		return strings.TrimPrefix(value, "feishu:")
 	}
@@ -249,7 +404,7 @@ func shouldExpandBindingRoot(req SourceTreeChildrenRequest, binding store.Bindin
 }
 
 func shouldFetchLiveBindingRoot(req SourceTreeChildrenRequest, binding store.Binding) bool {
-	if binding.ConnectorType != "feishu" || binding.TargetType != "wiki_node" {
+	if binding.ConnectorType != "local_fs" && !(binding.ConnectorType == "feishu" && binding.TargetType == "wiki_node") {
 		return false
 	}
 	return shouldExpandBindingRoot(req, binding, effectiveSourceParentKey(req, binding))

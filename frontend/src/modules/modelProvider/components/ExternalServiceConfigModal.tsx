@@ -207,22 +207,39 @@ export default function ExternalServiceConfigModal({
     });
   }
 
+  async function writeTextToClipboard(text: string) {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.readOnly = true;
+    textarea.style.position = "fixed";
+    textarea.style.left = "-9999px";
+    textarea.style.top = "0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    let copied = false;
+    try {
+      if (typeof document.execCommand === "function") {
+        copied = document.execCommand("copy");
+      }
+    } finally {
+      document.body.removeChild(textarea);
+    }
+    if (copied) {
+      return;
+    }
+
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+
+    throw new Error("Copy command failed");
+  }
+
   async function copyKeyToClipboard(key: string) {
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(key);
-      } else {
-        const textarea = document.createElement("textarea");
-        textarea.value = key;
-        textarea.style.position = "fixed";
-        textarea.style.left = "-9999px";
-        document.body.appendChild(textarea);
-        textarea.focus();
-        textarea.select();
-        const copied = document.execCommand("copy");
-        document.body.removeChild(textarea);
-        if (!copied) throw new Error("Copy command failed");
-      }
+      await writeTextToClipboard(key);
       message.success(t("common.copySuccess"));
     } catch {
       message.error(t("common.copyFailedManual"));
@@ -318,7 +335,7 @@ export default function ExternalServiceConfigModal({
       destroyOnClose
       footer={[
         <Button key="close" onClick={handleClose}>
-          {t("modelProvider.external.saveConfig")}
+          {t("common.close")}
         </Button>,
       ]}
       onCancel={handleClose}
@@ -392,10 +409,10 @@ export default function ExternalServiceConfigModal({
                     {visibleKeys.has(idx) ? key : maskAPIKey(key)}
                   </span>
                   <div className="model-provider-key-actions">
-                    <Tooltip title="复制">
+                    <Tooltip title={t("common.copy")}>
                       <Button size="small" type="text" icon={<CopyOutlined />} onClick={() => copyKeyToClipboard(key)} />
                     </Tooltip>
-                    <Tooltip title={visibleKeys.has(idx) ? "隐藏" : "显示"}>
+                    <Tooltip title={visibleKeys.has(idx) ? t("common.hide") : t("common.show")}>
                       <Button
                         size="small"
                         type="text"

@@ -7,8 +7,9 @@ import {
   useCallback,
   ReactNode,
 } from "react";
-import { Spin, Flex, message } from "antd";
+import { Spin, Flex, Tooltip, message } from "antd";
 import {
+  CommentOutlined,
   DoubleRightOutlined,
   DownOutlined,
   UpOutlined,
@@ -40,6 +41,7 @@ import { useModelSelectionStore } from "@/modules/chat/store/modelSelection";
 import type { PreferenceType } from "../MultiAnswerDisplay";
 import { ChatServiceApi } from "@/modules/chat/utils/request";
 import { useChatMessageStore } from "@/modules/chat/store/chatMessage";
+import { useTaskCenterStore } from "@/modules/chat/store/taskCenter";
 import { CHAT_RESUME_CONVERSATION_KEY } from "@/modules/chat/constants/chat";
 import { useTranslation } from "react-i18next";
 import { getRegenerationInputs } from "@/modules/chat/utils/message";
@@ -63,6 +65,32 @@ function buildCitedMessageText(text: string, citeMessages?: string[]) {
     .map((citeMessage) => `<cite_message>${citeMessage}</cite_message>`)
     .join("\n");
   return `${citedText}\n${normalizedText}`;
+}
+
+function splitCiteMessages(citeMessage?: string) {
+  return (citeMessage || "")
+    .split(/\n{2,}/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function getCiteMessages(message?: { cite_message?: string; cite_messages?: string[] }) {
+  if (Array.isArray(message?.cite_messages)) {
+    return message.cite_messages.map((item) => item.trim()).filter(Boolean);
+  }
+  const textInput = (message as any)?.inputs?.find((input: any) => {
+    const inputType = input?.input_type || "text";
+    return inputType === "text" && typeof input?.text === "string";
+  });
+  const inputCites = Array.from(
+    `${textInput?.text || ""}`.matchAll(/<cite_message>([\s\S]*?)<\/cite_message>/gi),
+  )
+    .map((match) => match[1]?.trim())
+    .filter(Boolean);
+  if (inputCites.length > 0) {
+    return inputCites;
+  }
+  return splitCiteMessages(message?.cite_message);
 }
 
 export interface ChatImperativeProps {
@@ -136,6 +164,7 @@ export interface ChatMessage {
   is_resumed?: boolean;
   display_delta?: string;
   cite_message?: string;
+  cite_messages?: string[];
 }
 
 const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
@@ -202,6 +231,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
     const [content, setContent] = useState("");
     const [editingUserMessageIndex, setEditingUserMessageIndex] = useState<number | null>(null);
     const [editingUserMessageText, setEditingUserMessageText] = useState("");
+    const [editingUserMessageCites, setEditingUserMessageCites] = useState<string[]>([]);
     const [thinkingCollapseMap, setThinkingCollapseMap] = useState<
       Map<string, boolean>
     >(new Map());
@@ -253,6 +283,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       ) {
         setEditingUserMessageIndex(null);
         setEditingUserMessageText("");
+        setEditingUserMessageCites([]);
       }
     }, [editingUserMessageIndex, messageList]);
 
@@ -356,6 +387,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
         delta: normalizedText,
         display_delta: normalizedText,
         cite_message: normalizedCiteMessages.join("\n\n"),
+        cite_messages: normalizedCiteMessages,
         role: RoleTypes.USER,
         images: tempGroup?.image,
         files: tempGroup?.file,
@@ -480,6 +512,28 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       const result = UIUtils.jsonParser(e.data)?.result;
       if (!result) {
         return;
+      }
+
+      if (result.task_created && result.task_created.task_id) {
+        const convId =
+          result.conversation_id || currentConversationIdRef.current || "";
+        const tc = result.task_created;
+        const taskStore = useTaskCenterStore.getState();
+        taskStore.upsertTask(convId, {
+          task_id: tc.task_id,
+          title: tc.title,
+          agent_type: tc.agent_type,
+          mode: tc.mode,
+          status: tc.status || "pending",
+        });
+        taskStore.subscribeTask(convId, tc.task_id);
+        if (tc.agent_type === "plugin_step" && tc.plugin_session_id) {
+          import("@/modules/chat/store/pluginPanel").then(
+            ({ usePluginStore }) => {
+              usePluginStore.getState().loadActiveSession(convId);
+            }
+          );
+        }
       }
 
       const messageConversationId = result.conversation_id || "";
@@ -899,6 +953,13 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
 
       currentConversationIdRef.current = id;
 
+      // Load plugin session for this conversation (if any) so the toolbar icon shows.
+      if (id) {
+        import("@/modules/chat/store/pluginPanel").then(({ usePluginStore }) => {
+          usePluginStore.getState().loadActiveSession(id);
+        });
+      }
+
       streamManager.setActiveConversation(id || null);
 
       if (id && streamManager.hasActiveStream(id)) {
@@ -1045,6 +1106,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       messageListRef.current = [];
       setEditingUserMessageIndex(null);
       setEditingUserMessageText("");
+      setEditingUserMessageCites([]);
       setLoading(false);
       setIS_STREAMING(false);
 
@@ -1198,11 +1260,19 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       }
       setEditingUserMessageIndex(index);
       setEditingUserMessageText(item?.delta || "");
+      setEditingUserMessageCites(getCiteMessages(item));
     }
 
     function handleCancelEditUserMessage() {
       setEditingUserMessageIndex(null);
       setEditingUserMessageText("");
+      setEditingUserMessageCites([]);
+    }
+
+    function handleRemoveEditingUserMessageCite(index: number) {
+      setEditingUserMessageCites((prev) =>
+        prev.filter((_, itemIndex) => itemIndex !== index),
+      );
     }
 
     function handleResendEditedUserMessage(index: number, value: string) {
@@ -1226,14 +1296,18 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       }
 
       const oldInputs = Array.isArray(oldUserMessage.inputs) ? oldUserMessage.inputs : [];
+      const textWithCitation = buildCitedMessageText(normalizedText, editingUserMessageCites);
       const rebuiltInputs = oldInputs
         .filter((input: any) => (input?.input_type || "text") !== "text")
         .map((input: any) => ({ ...input }));
-      rebuiltInputs.unshift({ input_type: "text", text: normalizedText });
+      rebuiltInputs.unshift({ input_type: "text", text: textWithCitation });
 
       const newUserMessage = {
         ...oldUserMessage,
         delta: normalizedText,
+        display_delta: normalizedText,
+        cite_message: editingUserMessageCites.join("\n\n"),
+        cite_messages: editingUserMessageCites,
         inputs: rebuiltInputs,
       };
 
@@ -1257,6 +1331,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       setMessageList(newList);
       setEditingUserMessageIndex(null);
       setEditingUserMessageText("");
+      setEditingUserMessageCites([]);
 
       const currentId = currentConversationIdRef.current;
       if (currentId) {
@@ -1272,6 +1347,8 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
     function renderText(item: any, uniqueKey?: string) {
       const thinkingKey = uniqueKey || item.history_id || item.id || "default";
       const isCollapsed = thinkingCollapseMap.get(thinkingKey) || false;
+      const citeMessageList =
+        item.role === RoleTypes.USER ? getCiteMessages(item) : [];
 
       const toggleCollapse = () => {
         setThinkingCollapseMap((prev) => {
@@ -1284,6 +1361,25 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
         <Flex vertical>
           {item.images && <ChatImages images={item.images} />}
           {item.files && <ChatFiles files={item.files} />}
+          {citeMessageList.length > 0 ? (
+            <Tooltip
+              placement="topRight"
+              overlayClassName="chat-user-citation-tooltip"
+              title={
+                <div className="chat-user-citation-tooltip-content">
+                  {citeMessageList.map((citeMessage, index) => (
+                    <div className="chat-user-citation-tooltip-item" key={`${index}-${citeMessage}`}>
+                      {citeMessage}
+                    </div>
+                  ))}
+                </div>
+              }
+            >
+              <span className="chat-user-citation-icon" aria-label={t("chat.cite")}>
+                <CommentOutlined />
+              </span>
+            </Tooltip>
+          ) : null}
           {item.reasoning_content && (
             <>
               <div className="chat-think-status" onClick={toggleCollapse}>
@@ -1457,6 +1553,9 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
 
           return [...prev, normalizedText];
         });
+        requestAnimationFrame(() => {
+          chatInputRef.current?.focus();
+        });
       },
       [t],
     );
@@ -1487,7 +1586,9 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
             onPreferenceSelect={handlePreferenceSelect}
             editingUserMessageIndex={editingUserMessageIndex}
             editingUserMessageText={editingUserMessageText}
+            editingUserMessageCites={editingUserMessageCites}
             onUserMessageEditTextChange={setEditingUserMessageText}
+            onRemoveEditingUserMessageCite={handleRemoveEditingUserMessageCite}
             onStartEditUserMessage={handleStartEditUserMessage}
             onCancelEditUserMessage={handleCancelEditUserMessage}
             onResendEditedUserMessage={handleResendEditedUserMessage}
@@ -1522,6 +1623,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
             isChatContent={true}
             showHistoryList={showHistoryList}
             showHistoryButton={showHistoryButton}
+            showPromptSuggestions={false}
             openNewChat={createNewChat}
             ref={chatInputRef}
             onHeightChange={handleInputHeightChange}

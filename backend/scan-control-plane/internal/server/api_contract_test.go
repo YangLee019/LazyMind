@@ -61,6 +61,46 @@ func TestCreateSourceHandlerRequiresBindingsArray(t *testing.T) {
 	}
 }
 
+func TestCreateSourceHandlerRejectsLocalSourceForNonAdmin(t *testing.T) {
+	t.Parallel()
+
+	engine := &serverSourceEngineStub{}
+	handler := NewHandler(WithSourceEngine(engine), WithAccessChecker(allowAccess{}))
+	body := `{"request_id":"req-1","name":"Docs","bindings":[{"connector_type":"local_fs","target_type":"local_path","target_ref":"/workspace/docs","sync_mode":"manual"}],"source_options":{"source_type":"local"}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/scan/sources", strings.NewReader(body))
+	setAPIContractActorRole(req, "user")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected non-admin local source creation to be forbidden, got %d body=%s", w.Code, w.Body.String())
+	}
+	if engine.createCalls != 0 {
+		t.Fatalf("expected denied request not to call source engine, got %d calls", engine.createCalls)
+	}
+}
+
+func TestCreateSourceBindingRejectsLocalSourceForNonAdmin(t *testing.T) {
+	t.Parallel()
+
+	engine := &serverSourceEngineStub{}
+	handler := NewHandler(WithSourceEngine(engine), WithAccessChecker(allowAccess{}))
+	body := `{"connector_type":"local_fs","target_type":"local_path","target_ref":"/workspace/docs","sync_mode":"manual"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/scan/sources/source-1/bindings", strings.NewReader(body))
+	setAPIContractActorRole(req, "user")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected non-admin local binding creation to be forbidden, got %d body=%s", w.Code, w.Body.String())
+	}
+	if engine.addBindingCalls != 0 {
+		t.Fatalf("expected denied request not to add binding, got %d calls", engine.addBindingCalls)
+	}
+}
+
 func TestCreateSourceHandlerAcceptsStructuredProviderOptions(t *testing.T) {
 	t.Parallel()
 
@@ -172,7 +212,7 @@ func TestHandlersExposeConnectorsTargetTreeAndSourceTree(t *testing.T) {
 	setAPIContractActor(sourceReq)
 	sourceResp := httptest.NewRecorder()
 	handler.ServeHTTP(sourceResp, sourceReq)
-	if sourceResp.Code != http.StatusOK || sourceTree.childrenCalls != 1 || sourceTree.lastChildren.SourceID != "source-1" || !sourceTree.lastChildren.UseCache {
+	if sourceResp.Code != http.StatusOK || sourceTree.childrenCalls != 1 || sourceTree.lastChildren.SourceID != "source-1" || sourceTree.lastChildren.UseCache == nil || !*sourceTree.lastChildren.UseCache {
 		t.Fatalf("source tree handler did not set source_id: code=%d calls=%d req=%+v body=%s", sourceResp.Code, sourceTree.childrenCalls, sourceTree.lastChildren, sourceResp.Body.String())
 	}
 	if sourceTree.lastChildren.ProviderOptions["user_id"] != "user-1" || sourceTree.lastChildren.ProviderOptions["tenant_id"] != "tenant-1" {
@@ -204,6 +244,97 @@ func TestDocumentHandlerPassesFiltersAndPagination(t *testing.T) {
 	}
 	if got := documents.lastReq; got.Page != 2 || got.PageSize != 30 || len(got.StateFilter) != 2 || got.StateFilter[1] != "MODIFIED" || len(got.ParseStatuses) != 1 || got.ParseStatuses[0] != "PENDING" {
 		t.Fatalf("document query filters were not propagated: %+v", got)
+	}
+}
+
+func TestReadHandlersRefreshSourceStateByDefaultWithoutSyncingData(t *testing.T) {
+	t.Parallel()
+
+	sourceTree := &serverSourceTreeStub{}
+	documents := &serverDocumentQueryStub{}
+	refresher := &serverReadRefresherStub{}
+	handler := NewHandler(
+		WithSourceTreeQueryEngine(sourceTree),
+		WithSourceDocumentQuery(documents),
+		WithSourceReadRefresher(refresher),
+		WithAccessChecker(allowAccess{}),
+	)
+
+	treeReq := httptest.NewRequest(http.MethodPost, "/api/scan/sources/source-1/tree/children", strings.NewReader(`{"binding_id":"binding-1"}`))
+	setAPIContractActor(treeReq)
+	treeResp := httptest.NewRecorder()
+	handler.ServeHTTP(treeResp, treeReq)
+	if treeResp.Code != http.StatusOK {
+		t.Fatalf("tree read failed: code=%d body=%s", treeResp.Code, treeResp.Body.String())
+	}
+	if refresher.calls != 1 || refresher.lastReq.SourceID != "source-1" || refresher.lastReq.BindingID != "binding-1" {
+		t.Fatalf("default tree read did not refresh source state: calls=%d req=%+v", refresher.calls, refresher.lastReq)
+	}
+
+	cachedTreeReq := httptest.NewRequest(http.MethodPost, "/api/scan/sources/source-1/tree/children", strings.NewReader(`{"binding_id":"binding-1","use_cache":true}`))
+	setAPIContractActor(cachedTreeReq)
+	cachedTreeResp := httptest.NewRecorder()
+	handler.ServeHTTP(cachedTreeResp, cachedTreeReq)
+	if cachedTreeResp.Code != http.StatusOK {
+		t.Fatalf("cached tree read failed: code=%d body=%s", cachedTreeResp.Code, cachedTreeResp.Body.String())
+	}
+	if refresher.calls != 2 || refresher.lastReq.SourceID != "source-1" || refresher.lastReq.BindingID != "binding-1" {
+		t.Fatalf("cached tree read should still refresh source state: calls=%d req=%+v", refresher.calls, refresher.lastReq)
+	}
+
+	cachedOnlyTreeReq := httptest.NewRequest(http.MethodPost, "/api/scan/sources/source-1/tree/children", strings.NewReader(`{"binding_id":"binding-1","use_cache":true,"refresh_state":false}`))
+	setAPIContractActor(cachedOnlyTreeReq)
+	cachedOnlyTreeResp := httptest.NewRecorder()
+	handler.ServeHTTP(cachedOnlyTreeResp, cachedOnlyTreeReq)
+	if cachedOnlyTreeResp.Code != http.StatusOK {
+		t.Fatalf("cached-only tree read failed: code=%d body=%s", cachedOnlyTreeResp.Code, cachedOnlyTreeResp.Body.String())
+	}
+	if refresher.calls != 2 {
+		t.Fatalf("explicit refresh_state=false tree read should not refresh source state, calls=%d", refresher.calls)
+	}
+
+	searchReq := httptest.NewRequest(http.MethodPost, "/api/scan/sources/source-1/tree/search", strings.NewReader(`{"binding_id":"binding-1","keyword":"doc"}`))
+	setAPIContractActor(searchReq)
+	searchResp := httptest.NewRecorder()
+	handler.ServeHTTP(searchResp, searchReq)
+	if searchResp.Code != http.StatusOK {
+		t.Fatalf("tree search failed: code=%d body=%s", searchResp.Code, searchResp.Body.String())
+	}
+	if refresher.calls != 3 || refresher.lastReq.SourceID != "source-1" || refresher.lastReq.BindingID != "binding-1" {
+		t.Fatalf("tree search did not refresh source state: calls=%d req=%+v", refresher.calls, refresher.lastReq)
+	}
+
+	cachedSearchReq := httptest.NewRequest(http.MethodPost, "/api/scan/sources/source-1/tree/search", strings.NewReader(`{"binding_id":"binding-1","keyword":"doc","refresh_state":false}`))
+	setAPIContractActor(cachedSearchReq)
+	cachedSearchResp := httptest.NewRecorder()
+	handler.ServeHTTP(cachedSearchResp, cachedSearchReq)
+	if cachedSearchResp.Code != http.StatusOK {
+		t.Fatalf("cached tree search failed: code=%d body=%s", cachedSearchResp.Code, cachedSearchResp.Body.String())
+	}
+	if refresher.calls != 3 {
+		t.Fatalf("explicit refresh_state=false tree search should not refresh source state, calls=%d", refresher.calls)
+	}
+
+	docReq := httptest.NewRequest(http.MethodGet, "/api/scan/sources/source-1/documents?binding_id=binding-1", nil)
+	setAPIContractActor(docReq)
+	docResp := httptest.NewRecorder()
+	handler.ServeHTTP(docResp, docReq)
+	if docResp.Code != http.StatusOK {
+		t.Fatalf("document read failed: code=%d body=%s", docResp.Code, docResp.Body.String())
+	}
+	if refresher.calls != 4 || refresher.lastReq.SourceID != "source-1" || refresher.lastReq.BindingID != "binding-1" {
+		t.Fatalf("default document read did not refresh source state: calls=%d req=%+v", refresher.calls, refresher.lastReq)
+	}
+
+	cachedDocReq := httptest.NewRequest(http.MethodGet, "/api/scan/sources/source-1/documents?binding_id=binding-1&refresh_state=false", nil)
+	setAPIContractActor(cachedDocReq)
+	cachedDocResp := httptest.NewRecorder()
+	handler.ServeHTTP(cachedDocResp, cachedDocReq)
+	if cachedDocResp.Code != http.StatusOK {
+		t.Fatalf("cached document read failed: code=%d body=%s", cachedDocResp.Code, cachedDocResp.Body.String())
+	}
+	if refresher.calls != 4 {
+		t.Fatalf("explicit cached document read should not refresh source state, calls=%d", refresher.calls)
 	}
 }
 
@@ -324,6 +455,42 @@ func TestLocalFSBindingTargetValidateAndChildrenAcceptMissingAgentID(t *testing.
 	}
 }
 
+func TestTreeSearchHandlersAcceptPageListMode(t *testing.T) {
+	t.Parallel()
+
+	targetTree := &serverTargetTreeStub{}
+	sourceTree := &serverSourceTreeStub{}
+	handler := NewHandler(
+		WithTargetTreeEngine(targetTree),
+		WithSourceTreeQueryEngine(sourceTree),
+		WithAccessChecker(allowAccess{}),
+	)
+
+	targetReq := httptest.NewRequest(http.MethodPost, "/api/scan/binding-targets/tree/search", strings.NewReader(`{"connector_type":"local_fs","target_type":"local_path","keyword":"/workspace","include_files":false,"list_mode":"page","page_size":50}`))
+	setAPIContractActor(targetReq)
+	targetResp := httptest.NewRecorder()
+	handler.ServeHTTP(targetResp, targetReq)
+
+	if targetResp.Code != http.StatusOK {
+		t.Fatalf("target search expected OK, got %d body=%s", targetResp.Code, targetResp.Body.String())
+	}
+	if targetTree.searchCalls != 1 || targetTree.lastSearch.ListMode != tree.ListModePage || targetTree.lastSearch.PageSize != 50 {
+		t.Fatalf("target search request was not decoded with list_mode/page_size: %+v", targetTree.lastSearch)
+	}
+
+	sourceReq := httptest.NewRequest(http.MethodPost, "/api/scan/sources/source-1/tree/search", strings.NewReader(`{"binding_id":"binding-1","tree_key":"tree-root","keyword":"hand","include_documents":true,"include_containers":true,"list_mode":"page","page_size":50}`))
+	setAPIContractActor(sourceReq)
+	sourceResp := httptest.NewRecorder()
+	handler.ServeHTTP(sourceResp, sourceReq)
+
+	if sourceResp.Code != http.StatusOK {
+		t.Fatalf("source search expected OK, got %d body=%s", sourceResp.Code, sourceResp.Body.String())
+	}
+	if sourceTree.searchCalls != 1 || sourceTree.lastSearch.ListMode != tree.ListModePage || sourceTree.lastSearch.PageSize != 50 {
+		t.Fatalf("source search request was not decoded with list_mode/page_size: %+v", sourceTree.lastSearch)
+	}
+}
+
 func TestSyncHandlerAllowsMissingRequestIDAndEmptyBody(t *testing.T) {
 	t.Parallel()
 
@@ -391,8 +558,13 @@ func TestErrorResponseAlwaysIncludesDetailsObject(t *testing.T) {
 }
 
 func setAPIContractActor(req *http.Request) {
+	setAPIContractActorRole(req, "system-admin")
+}
+
+func setAPIContractActorRole(req *http.Request, role string) {
 	req.Header.Set("X-User-ID", "user-1")
 	req.Header.Set("X-Tenant-ID", "tenant-1")
+	req.Header.Set("X-User-Role", role)
 }
 
 type allowAccess struct{}
@@ -631,9 +803,10 @@ func assertJSONNumber(t *testing.T, value any, want string) {
 }
 
 type serverSourceEngineStub struct {
-	createCalls int
-	lastCreate  sourceengine.CreateSourceRequest
-	lastSync    sourceengine.TriggerSourceSyncRequest
+	createCalls     int
+	addBindingCalls int
+	lastCreate      sourceengine.CreateSourceRequest
+	lastSync        sourceengine.TriggerSourceSyncRequest
 }
 
 func (s *serverSourceEngineStub) CreateSource(_ context.Context, req sourceengine.CreateSourceRequest) (sourceengine.CreateSourceResponse, error) {
@@ -693,6 +866,7 @@ func (s *serverSourceEngineStub) DeleteSource(context.Context, string) (sourceen
 }
 
 func (s *serverSourceEngineStub) AddBinding(context.Context, string, string, sourceengine.BindingInput) (sourceengine.BindingMutationResponse, error) {
+	s.addBindingCalls++
 	return sourceengine.BindingMutationResponse{}, nil
 }
 
@@ -707,6 +881,8 @@ func (s *serverSourceEngineStub) DeleteBinding(context.Context, string, string) 
 type serverTargetTreeStub struct {
 	childrenCalls int
 	lastChildren  tree.TargetTreeChildrenRequest
+	searchCalls   int
+	lastSearch    tree.TargetTreeSearchRequest
 }
 
 type serverTaskPlannerStub struct {
@@ -736,13 +912,17 @@ func (s *serverTargetTreeStub) ListChildren(_ context.Context, req tree.TargetTr
 	return tree.TreeNodePage{Items: []tree.TreeNode{{Key: "node-1", DisplayName: "Node", IsContainer: true, HasChildren: true}}}, nil
 }
 
-func (s *serverTargetTreeStub) Search(context.Context, tree.TargetTreeSearchRequest) (tree.TreeNodePage, error) {
+func (s *serverTargetTreeStub) Search(_ context.Context, req tree.TargetTreeSearchRequest) (tree.TreeNodePage, error) {
+	s.searchCalls++
+	s.lastSearch = req
 	return tree.TreeNodePage{}, nil
 }
 
 type serverSourceTreeStub struct {
 	childrenCalls int
 	lastChildren  tree.SourceTreeChildrenRequest
+	searchCalls   int
+	lastSearch    tree.SourceTreeSearchRequest
 }
 
 func (s *serverSourceTreeStub) ListChildren(_ context.Context, req tree.SourceTreeChildrenRequest) (tree.TreeNodePage, error) {
@@ -751,7 +931,9 @@ func (s *serverSourceTreeStub) ListChildren(_ context.Context, req tree.SourceTr
 	return tree.TreeNodePage{Items: []tree.TreeNode{{Key: "binding-1", DisplayName: "Binding", BindingID: req.BindingID, SourceID: req.SourceID, IsContainer: true}}}, nil
 }
 
-func (s *serverSourceTreeStub) Search(context.Context, tree.SourceTreeSearchRequest) (tree.TreeNodePage, error) {
+func (s *serverSourceTreeStub) Search(_ context.Context, req tree.SourceTreeSearchRequest) (tree.TreeNodePage, error) {
+	s.searchCalls++
+	s.lastSearch = req
 	return tree.TreeNodePage{}, nil
 }
 
@@ -764,6 +946,17 @@ func (s *serverDocumentQueryStub) ListDocuments(_ context.Context, req tree.Sour
 	s.calls++
 	s.lastReq = req
 	return tree.SourceDocumentListResponse{Items: []tree.SourceDocumentItem{{SourceID: req.SourceID, BindingID: req.BindingID, ObjectKey: "doc-1", DisplayName: "Doc"}}}, nil
+}
+
+type serverReadRefresherStub struct {
+	calls   int
+	lastReq tree.SourceReadRefreshRequest
+}
+
+func (s *serverReadRefresherStub) RefreshSourceRead(_ context.Context, req tree.SourceReadRefreshRequest) error {
+	s.calls++
+	s.lastReq = req
+	return nil
 }
 
 type apiContractConnectorStub struct {

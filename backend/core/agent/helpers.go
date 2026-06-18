@@ -76,6 +76,10 @@ func threadActionURL(threadID, action string) string {
 	)
 }
 
+func threadDeleteURL(threadID string) string {
+	return common.JoinURL(agentServiceEndpoint(), "/v1/evo/threads/"+url.PathEscape(threadID))
+}
+
 func threadFlowStatusURL(threadID string) string {
 	return common.JoinURL(agentServiceEndpoint(), "/v1/evo/threads/"+url.PathEscape(threadID)+"/flow-status")
 }
@@ -84,11 +88,30 @@ func threadEventsURL(threadID string) string {
 	return common.JoinURL(agentServiceEndpoint(), "/v1/evo/threads/"+url.PathEscape(threadID)+"/events")
 }
 
+func threadArtifactURL(threadID, artifactID string) string {
+	return common.JoinURL(
+		agentServiceEndpoint(),
+		"/v1/evo/threads/"+url.PathEscape(threadID)+"/artifacts/"+url.PathEscape(artifactID),
+	)
+}
+
 func threadResultsURL(threadID, resultKind string) string {
 	return common.JoinURL(
 		agentServiceEndpoint(),
 		"/v1/evo/threads/"+url.PathEscape(threadID)+"/results/"+strings.Trim(strings.TrimSpace(resultKind), "/"),
 	)
+}
+
+func threadResultTraceURL(threadID, traceID string) string {
+	return common.JoinURL(
+		agentServiceEndpoint(),
+		"/v1/evo/threads/"+url.PathEscape(threadID)+"/results/traces/"+url.PathEscape(traceID),
+	)
+}
+
+func threadResultTraceCompareURL(threadID, aTraceID, bTraceID string) string {
+	base := common.JoinURL(agentServiceEndpoint(), "/v1/evo/threads/"+url.PathEscape(threadID)+"/results/traces-compare")
+	return base + "?a=" + url.QueryEscape(aTraceID) + "&b=" + url.QueryEscape(bTraceID)
 }
 
 func reportContentURL(reportID, format string) string {
@@ -382,6 +405,44 @@ func extractAssistantTextFromFrameData(rawData string) string {
 		return ""
 	}
 	return extractPreferredText(payload, "delta", "reply", "message", "content", "text")
+}
+
+func frontendMessageStreamData(eventName, rawData string) string {
+	rawData = strings.TrimSpace(rawData)
+	if rawData == "" || rawData == "[DONE]" {
+		return rawData
+	}
+	payload := parseJSONValue(rawData)
+	record, ok := payload.(map[string]any)
+	if !ok {
+		return rawData
+	}
+	eventType := extractStringByExactKeys(record, "type")
+	if eventType == "" {
+		eventType = strings.TrimSpace(eventName)
+	}
+	if eventType != "assistant_response" {
+		return rawData
+	}
+	content := extractPreferredText(record, "content", "message", "text", "reply", "delta")
+	if content == "" {
+		return rawData
+	}
+	next := make(map[string]any, len(record)+4)
+	for key, value := range record {
+		next[key] = value
+	}
+	next["original_type"] = eventType
+	next["type"] = "message.assistant"
+	next["role"] = "assistant"
+	next["content"] = content
+	next["message"] = content
+	next["delta"] = content
+	encoded, err := json.Marshal(next)
+	if err != nil {
+		return rawData
+	}
+	return string(encoded)
 }
 
 func logUpstreamSSEData(endpoint, threadID, roundID, taskID, eventName, rawData string) {

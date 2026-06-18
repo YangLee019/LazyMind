@@ -68,6 +68,8 @@ func newDocumentTestDB(t *testing.T) *orm.DB {
 		&orm.Dataset{},
 		&orm.Document{},
 		&orm.Task{},
+		&orm.DefaultDataset{},
+		&orm.EvalSet{},
 		&readonlyorm.LazyLLMDocRow{},
 		&readonlyorm.LazyLLMDocServiceTaskRow{},
 	); err != nil {
@@ -127,6 +129,77 @@ func TestLoadMergedDocumentsUsesCoreUpdatedAtWhenNewerThanReadonlyBase(t *testin
 	doc := docFromRow(rows[0])
 	if doc.UpdateTime != coreUpdatedAt.Format(time.RFC3339) {
 		t.Fatalf("expected document update_time %q, got %q", coreUpdatedAt.Format(time.RFC3339), doc.UpdateTime)
+	}
+}
+
+func TestBuildTaskResponseDoesNotSucceedBeforeExternalTaskRowExists(t *testing.T) {
+	db := newDocumentTestDB(t)
+	now := time.Date(2026, 5, 2, 10, 30, 0, 0, time.UTC)
+
+	if err := db.Create(&orm.Document{
+		ID:           "doc-core",
+		LazyllmDocID: "doc-lazy",
+		DatasetID:    "dataset-1",
+		DisplayName:  "report.pdf",
+		FileID:       "doc-core",
+		Tags:         []byte(`[]`),
+		Ext:          []byte(`{}`),
+		BaseModel: orm.BaseModel{
+			CreateUserID:   "user-1",
+			CreateUserName: "Alice",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+	}).Error; err != nil {
+		t.Fatalf("create core document: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/core/datasets/dataset-1/tasks/task-core", nil)
+	resp := buildTaskResponse(req, orm.Task{
+		ID:            "task-core",
+		LazyllmTaskID: "lazy-task-pending-row",
+		DocID:         "doc-core",
+		DatasetID:     "dataset-1",
+		TaskType:      string(TaskTypeParse),
+		DisplayName:   "report.pdf",
+		Ext:           []byte(`{}`),
+		BaseModel: orm.BaseModel{
+			CreateUserID:   "user-1",
+			CreateUserName: "Alice",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+	})
+
+	if resp.TaskState != "WORKING" {
+		t.Fatalf("expected task to keep polling before external row exists, got %+v", resp)
+	}
+}
+
+func TestUITaskStatusRunningIncludesLazyllmActiveStates(t *testing.T) {
+	states := uiTaskStatusToInternalStates("running")
+	for _, want := range []string{"WAITING", "WORKING"} {
+		found := false
+		for _, state := range states {
+			if state == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected running filter to include %s, got %v", want, states)
+		}
+	}
+}
+
+func TestTaskStateMatchesUIRunningFilter(t *testing.T) {
+	for _, state := range []string{"WAITING", "WORKING"} {
+		if !taskStateMatchesFilter(state, "running") {
+			t.Fatalf("expected %s to match running filter", state)
+		}
+	}
+	if taskStateMatchesFilter("SUCCESS", "running") {
+		t.Fatalf("expected SUCCESS not to match running filter")
 	}
 }
 
@@ -211,6 +284,41 @@ func TestListDocumentsByDatasetsKeywordMatchesDocumentNameOnly(t *testing.T) {
 		t.Fatalf("expected only name match, total=%d len=%d body=%s", body.TotalSize, len(body.Documents), rec.Body.String())
 	}
 	if got, want := body.Documents[0].DocumentID, "doc-name"; got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestListDocumentsByDatasetsExcludesFolders(t *testing.T) {
+	db := newDocumentTestDB(t)
+	seedDocumentListDataset(t, db, "dataset-a", "user-1")
+	now := time.Date(2026, 6, 4, 10, 0, 0, 0, time.UTC)
+	if err := db.Create(&orm.Document{
+		ID:          "folder-1",
+		DatasetID:   "dataset-a",
+		DisplayName: "folder",
+		Tags:        []byte(`[]`),
+		Ext:         json.RawMessage(`{}`),
+		BaseModel: orm.BaseModel{
+			CreateUserID:   "user-1",
+			CreateUserName: "Alice",
+			CreatedAt:      now.Add(-time.Hour),
+			UpdatedAt:      now,
+		},
+	}).Error; err != nil {
+		t.Fatalf("create folder: %v", err)
+	}
+	seedDocumentListDoc(t, db, "dataset-a", "doc-1", "report.pdf", now.Add(-time.Minute), "Alice", nil)
+
+	rec := requestListDocumentsByDatasets(t, `{"dataset_ids":["dataset-a"]}`, "user-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body ListDocumentsResponse
+	decodeRecorderJSON(t, rec, &body)
+	if body.TotalSize != 1 || len(body.Documents) != 1 {
+		t.Fatalf("expected only one document, total=%d len=%d body=%s", body.TotalSize, len(body.Documents), rec.Body.String())
+	}
+	if got, want := body.Documents[0].DocumentID, "doc-1"; got != want {
 		t.Fatalf("expected %q, got %q", want, got)
 	}
 }

@@ -19,10 +19,12 @@ import {
   PlusOutlined,
   SearchOutlined,
 } from "@ant-design/icons";
+import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import {
   createDataset,
   deleteDataset,
+  getDataset,
   listDatasets,
   listKnowledgeBases,
   updateDataset,
@@ -40,13 +42,16 @@ const { Text, Paragraph } = Typography;
 
 export default function DatasetListPage() {
   const navigate = useNavigate();
+  const { t } = useTranslation();
   const [datasets, setDatasets] = useState<DatasetListItem[]>([]);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseOption[]>([]);
   const [keyword, setKeyword] = useState("");
   const [loading, setLoading] = useState(false);
   const [formModalOpen, setFormModalOpen] = useState(false);
   const [editingDataset, setEditingDataset] = useState<DatasetListItem | null>(null);
+  const [editingDatasetId, setEditingDatasetId] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [editingLoadingId, setEditingLoadingId] = useState("");
 
   const loadDatasets = async (nextKeyword = keyword) => {
     setLoading(true);
@@ -58,7 +63,7 @@ export default function DatasetListPage() {
       setDatasets(datasetList);
       setKnowledgeBases(kbList);
     } catch (error: any) {
-      message.error(error?.message || "数据集加载失败");
+      message.error(error?.message || t("datasetManagement.list.message.loadFailed"));
     } finally {
       setLoading(false);
     }
@@ -75,24 +80,40 @@ export default function DatasetListPage() {
 
   const handleOpenCreate = () => {
     setEditingDataset(null);
+    setEditingDatasetId("");
     setFormModalOpen(true);
   };
 
-  const handleOpenEdit = (dataset: DatasetListItem) => {
-    setEditingDataset(dataset);
-    setFormModalOpen(true);
+  const handleOpenEdit = async (dataset: DatasetListItem) => {
+    setEditingLoadingId(dataset.id);
+    try {
+      const detail = await getDataset(dataset.id);
+      setEditingDataset(detail);
+      setEditingDatasetId(detail.id);
+      setFormModalOpen(true);
+    } catch (error: any) {
+      message.error(error?.message || t("datasetManagement.list.message.detailLoadFailed"));
+    } finally {
+      setEditingLoadingId("");
+    }
+  };
+
+  const handleCloseFormModal = () => {
+    setFormModalOpen(false);
+    setEditingDataset(null);
+    setEditingDatasetId("");
   };
 
   const handleDelete = (dataset: DatasetListItem) => {
     Modal.confirm({
-      title: `确认删除 ${dataset.name}？`,
-      content: "删除后会影响该数据集下的全部样本，请谨慎操作。",
-      okText: "删除",
+      title: t("datasetManagement.list.confirmDeleteTitle", { name: dataset.name }),
+      content: t("datasetManagement.list.confirmDeleteContent"),
+      okText: t("common.delete"),
       okButtonProps: { danger: true },
-      cancelText: "取消",
+      cancelText: t("common.cancel"),
       onOk: async () => {
         await deleteDataset(dataset.id);
-        message.success("数据集已删除");
+        message.success(t("datasetManagement.list.message.deleted"));
         await loadDatasets();
       },
     });
@@ -101,14 +122,14 @@ export default function DatasetListPage() {
   const handleSubmitDataset = async (values: DatasetFormValues) => {
     setSubmitting(true);
     try {
-      if (editingDataset) {
-        await updateDataset(editingDataset.id, {
+      if (editingDatasetId) {
+        await updateDataset(editingDatasetId, {
           name: values.name,
           description: values.description,
           knowledge_base_ids: values.knowledge_base_ids,
         });
-        message.success("数据集已更新");
-        setFormModalOpen(false);
+        message.success(t("datasetManagement.list.message.updated"));
+        handleCloseFormModal();
         await loadDatasets();
         return;
       }
@@ -119,11 +140,11 @@ export default function DatasetListPage() {
         knowledge_base_ids: values.knowledge_base_ids,
       });
 
-      message.success("数据集已创建");
-      setFormModalOpen(false);
+      message.success(t("datasetManagement.list.message.created"));
+      handleCloseFormModal();
       navigate(`/dataset-management/${created.id}`);
-    } catch (error: any) {
-      message.error(error?.message || "保存失败");
+    } catch {
+      // The global axios interceptor already shows the backend error message.
     } finally {
       setSubmitting(false);
     }
@@ -132,7 +153,7 @@ export default function DatasetListPage() {
   const columns = useMemo<ColumnsType<DatasetListItem>>(
     () => [
       {
-        title: "数据集名称",
+        title: t("datasetManagement.fields.datasetName"),
         dataIndex: "name",
         width: 220,
         render: (_, record) => (
@@ -155,7 +176,7 @@ export default function DatasetListPage() {
         ),
       },
       {
-        title: "关联知识库",
+        title: t("datasetManagement.fields.knowledgeBase"),
         dataIndex: "knowledge_bases",
         width: 220,
         render: (_, record) =>
@@ -172,25 +193,25 @@ export default function DatasetListPage() {
           ),
       },
       {
-        title: "样本数",
+        title: t("datasetManagement.fields.sampleCount"),
         dataIndex: "sample_count",
         width: 100,
         render: (value) => value ?? 0,
       },
       {
-        title: "创建人",
+        title: t("datasetManagement.fields.owner"),
         dataIndex: "owner_id",
         width: 120,
         render: (_, record) => record.owner_name || record.owner_id || "-",
       },
       {
-        title: "更新时间",
+        title: t("datasetManagement.fields.updatedAt"),
         dataIndex: "updated_at",
         width: 150,
         render: (value) => formatDateTime(value),
       },
       {
-        title: "操作",
+        title: t("common.actions"),
         width: 240,
         fixed: "right",
         render: (_, record) => (
@@ -201,15 +222,16 @@ export default function DatasetListPage() {
               icon={<EyeOutlined />}
               onClick={() => navigate(`/dataset-management/${record.id}`)}
             >
-              进入
+              {t("datasetManagement.list.enter")}
             </Button>
             <Button
               type="link"
               size="small"
               icon={<EditOutlined />}
+              loading={editingLoadingId === record.id}
               onClick={() => handleOpenEdit(record)}
             >
-              编辑
+              {t("common.edit")}
             </Button>
             <Button
               type="link"
@@ -218,26 +240,26 @@ export default function DatasetListPage() {
               icon={<DeleteOutlined />}
               onClick={() => handleDelete(record)}
             >
-              删除
+              {t("common.delete")}
             </Button>
           </Space>
         ),
       },
     ],
-    [navigate],
+    [editingLoadingId, navigate, t],
   );
 
   return (
     <div className="dataset-page">
       <div className="dataset-page-header">
         <div>
-          <h2 className="admin-page-title">数据集管理</h2>
+          <h2 className="admin-page-title">{t("datasetManagement.list.title")}</h2>
           <p className="dataset-page-subtitle">
-            统一维护问答评测样本，支持手动编辑、文件导入和算法回流数据展示。
+            {t("datasetManagement.list.subtitle")}
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={handleOpenCreate}>
-          新建数据集
+          {t("datasetManagement.list.createDataset")}
         </Button>
       </div>
 
@@ -247,12 +269,12 @@ export default function DatasetListPage() {
             allowClear
             className="dataset-search-input"
             prefix={<SearchOutlined />}
-            placeholder="搜索数据集名称/描述"
+            placeholder={t("datasetManagement.list.searchPlaceholder")}
             value={keyword}
             onChange={(event) => setKeyword(event.target.value)}
             onPressEnter={handleSearch}
           />
-          <Button onClick={handleSearch}>搜索</Button>
+          <Button onClick={handleSearch}>{t("common.search")}</Button>
         </div>
         <Table
           rowKey="id"
@@ -263,18 +285,19 @@ export default function DatasetListPage() {
           scroll={{ x: 1050 }}
           pagination={{
             pageSize: 10,
-            showTotal: (total) => `共 ${total} 条`,
+            showTotal: (total) => t("common.totalItems", { total }),
           }}
         />
       </Card>
 
       <DatasetFormModal
+        key={editingDatasetId || "create"}
         open={formModalOpen}
-        mode={editingDataset ? "edit" : "create"}
+        mode={editingDatasetId ? "edit" : "create"}
         dataset={editingDataset}
         knowledgeBases={knowledgeBases}
         submitting={submitting}
-        onCancel={() => setFormModalOpen(false)}
+        onCancel={handleCloseFormModal}
         onSubmit={handleSubmitDataset}
       />
     </div>

@@ -22,6 +22,7 @@ import DataSourceDetail from "@/modules/dataSource/detail";
 import DataSourceFeishuCallback from "@/modules/dataSource/common/feishuCallback";
 import FeishuAccountPage from "@/modules/dataSource/feishuAccounts";
 import FeishuSetupGuide from "@/modules/dataSource/FeishuSetupGuide";
+import NotionSetupGuide from "@/modules/dataSource/NotionSetupGuide";
 import DatasetListPage from "@/modules/datasetManagement/pages/list";
 import DatasetDetailPage from "@/modules/datasetManagement/pages/detail";
 import MemoryManagement from "@/modules/memory";
@@ -34,7 +35,7 @@ import ModelProviderPage from "@/modules/modelProvider";
 import ModelProvidersPage from "@/modules/modelProvider/pages/ModelProvidersPage";
 import ExternalServicesPage from "@/modules/modelProvider/pages/ExternalServicesPage";
 import DefaultServicesPage from "@/modules/modelProvider/pages/DefaultServicesPage";
-import { SelfEvolutionHomePage, SelfEvolutionDetailPage } from "@/modules/selfEvolution";
+import { SelfEvolutionHomePage, SelfEvolutionDetailPage, SelfEvolutionObservationPage } from "@/modules/selfEvolution";
 import { getAntdLocale } from "@/i18n/antdLocale";
 
 export default function AppRouter() {
@@ -52,6 +53,14 @@ export default function AppRouter() {
         <Route
           path="/oauth/feishu/callback"
           element={<DataSourceFeishuCallback />}
+        />
+        <Route
+          path="/oauth/notion/data-source/callback"
+          element={<DataSourceFeishuCallback provider="notion" />}
+        />
+        <Route
+          path="/oauth/notion/callback"
+          element={<DataSourceFeishuCallback provider="notion" />}
         />
         <Route path="/loginTransition" element={<LoginTransition />} />
         <Route path="/" element={<MainLayout />}>
@@ -72,7 +81,9 @@ export default function AppRouter() {
           </Route>
           <Route path="data-sources" element={<DataSourceManagement />} />
           <Route path="data-sources/docs/feishu-setup" element={<FeishuSetupGuide />} />
+          <Route path="data-sources/docs/notion-setup" element={<NotionSetupGuide />} />
           <Route path="data-sources/providers/feishu" element={<FeishuAccountPage />} />
+          <Route path="data-sources/providers/notion" element={<DataSourceManagement />} />
           <Route path="data-sources/providers/sciverse" element={<Navigate to="/data-sources?view=connectors&provider=sciverse" replace />} />
           <Route path="data-sources/:id" element={<DataSourceDetail />} />
           <Route path="dataset-management" element={<DatasetListPage />} />
@@ -104,7 +115,9 @@ export default function AppRouter() {
             />
           </Route>
           <Route path="self-evolution" element={<SelfEvolutionHomePage />} />
+          <Route path="self-evolution/detail/:threadId/observation/:kind" element={<SelfEvolutionObservationPage />} />
           <Route path="self-evolution/detail/:threadId" element={<SelfEvolutionDetailPage />} />
+          <Route path="self-evolution/:threadId/observation/:kind" element={<SelfEvolutionObservationPage />} />
           <Route path="self-evolution/:threadId" element={<SelfEvolutionDetailPage />} />
         </Route>
         <Route path="/admin" element={<AdminLayout />}>

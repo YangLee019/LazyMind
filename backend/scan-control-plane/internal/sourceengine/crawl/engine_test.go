@@ -218,6 +218,104 @@ func TestCrawlEngineFullIndexesDualRoleBindingRootDocument(t *testing.T) {
 	assertCrawlState(t, repo.reducer, "root", "NEW", "CREATE")
 }
 
+func TestCrawlEnginePartialContainerRecursesChildren(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := crawlTestTime()
+	repo := newCrawlTestRepo(now)
+	conn := newCrawlTreeConnector(false, false, nil)
+	engine := newCrawlTestEngine(t, repo, conn, now)
+
+	result, err := engine.Run(ctx, BindingRunClaim{
+		RunID:             "run-partial-folder",
+		SourceID:          "source-1",
+		BindingID:         "binding-1",
+		BindingGeneration: 1,
+		ScopeType:         connector.ScopeTypePartial,
+		ScopeRef:          connector.ScopeRef{"object_key": "folder-1", "node_ref": "folder-1", "subtree_root": "folder-1"},
+	})
+	if err != nil || result.Status != RunStatusSucceeded {
+		t.Fatalf("partial subtree result=%+v err=%v", result, err)
+	}
+	if conn.fetchCalls != 0 || !slices.Equal(conn.listNodes, []string{"folder-1"}) {
+		t.Fatalf("container partial sync should traverse children without single-object fetch, fetches=%d lists=%v", conn.fetchCalls, conn.listNodes)
+	}
+	if _, ok := repo.objects["folder-1"]; ok {
+		t.Fatalf("ordinary container itself should not be indexed by subtree sync: %+v", repo.objects["folder-1"])
+	}
+	if _, ok := repo.objects["doc-1"]; !ok {
+		t.Fatalf("ordinary container subtree should index child document, objects=%+v", repo.objects)
+	}
+	assertCrawlState(t, repo.reducer, "doc-1", "NEW", "CREATE")
+}
+
+func TestCrawlEnginePartialContainerMarksMissingDescendantsDeleted(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := crawlTestTime()
+	repo := newCrawlTestRepo(now)
+	repo.reducer.seedStateWithParent("doc-missing", "folder-1", "stale-v1", "stale-v1", "UNCHANGED")
+	repo.reducer.seedStateWithParent("outside-doc", "other-folder", "outside-v1", "outside-v1", "UNCHANGED")
+	conn := newCrawlTreeConnector(false, false, nil)
+	engine := newCrawlTestEngine(t, repo, conn, now)
+
+	result, err := engine.Run(ctx, BindingRunClaim{
+		RunID:             "run-partial-delete",
+		SourceID:          "source-1",
+		BindingID:         "binding-1",
+		BindingGeneration: 1,
+		ScopeType:         connector.ScopeTypePartial,
+		ScopeRef:          connector.ScopeRef{"object_key": "folder-1", "node_ref": "folder-1", "subtree_root": "folder-1"},
+	})
+	if err != nil || result.Status != RunStatusSucceeded {
+		t.Fatalf("partial subtree result=%+v err=%v", result, err)
+	}
+	if result.Counts.Deleted != 1 {
+		t.Fatalf("expected one missing descendant delete, got %+v", result.Counts)
+	}
+	assertCrawlState(t, repo.reducer, "doc-missing", "DELETED", "DELETE")
+	assertCrawlState(t, repo.reducer, "outside-doc", "UNCHANGED", "")
+}
+
+func TestCrawlEnginePartialDualRoleContainerIncludesSelfAndChildren(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := crawlTestTime()
+	repo := newCrawlTestRepo(now)
+	repo.binding.ConnectorType = string(crawlDualRoleConnectorType)
+	conn := newCrawlTreeConnector(false, false, nil)
+	conn.connectorType = crawlDualRoleConnectorType
+	conn.dualRole = true
+	conn.fetchItems = []connector.RawObject{docRaw("folder-1", "root", "folder-v1")}
+	engine := newCrawlTestEngine(t, repo, conn, now)
+
+	result, err := engine.Run(ctx, BindingRunClaim{
+		RunID:             "run-partial-wiki-parent",
+		SourceID:          "source-1",
+		BindingID:         "binding-1",
+		BindingGeneration: 1,
+		ScopeType:         connector.ScopeTypePartial,
+		ScopeRef:          connector.ScopeRef{"object_key": "folder-1", "node_ref": "folder-1", "subtree_root": "folder-1"},
+	})
+	if err != nil || result.Status != RunStatusSucceeded {
+		t.Fatalf("partial dual-role subtree result=%+v err=%v", result, err)
+	}
+	if conn.fetchCalls != 1 || !slices.Equal(conn.fetchScopes, []connector.ScopeType{connector.ScopeTypeWatchEvent}) || !slices.Equal(conn.listNodes, []string{"folder-1"}) {
+		t.Fatalf("dual-role partial sync should fetch parent then traverse children, fetches=%d scopes=%v lists=%v", conn.fetchCalls, conn.fetchScopes, conn.listNodes)
+	}
+	if _, ok := repo.objects["folder-1"]; !ok {
+		t.Fatalf("dual-role parent document should be indexed, objects=%+v", repo.objects)
+	}
+	if _, ok := repo.objects["doc-1"]; !ok {
+		t.Fatalf("dual-role parent subtree should index child document, objects=%+v", repo.objects)
+	}
+	assertCrawlState(t, repo.reducer, "folder-1", "NEW", "CREATE")
+	assertCrawlState(t, repo.reducer, "doc-1", "NEW", "CREATE")
+}
+
 func TestCrawlEnginePermissionDeniedMarksBindingErrorWithoutDeleting(t *testing.T) {
 	t.Parallel()
 
@@ -329,6 +427,7 @@ func (r *crawlTestRepo) GetBinding(_ context.Context, sourceID, bindingID string
 func (r *crawlTestRepo) UpsertObjects(_ context.Context, objects []store.SourceObject) error {
 	for _, object := range objects {
 		r.objects[object.ObjectKey] = object
+		r.reducer.parents[object.ObjectKey] = object.ParentKey
 	}
 	return nil
 }
@@ -358,12 +457,17 @@ func assertCrawlState(t *testing.T, reducer *crawlTestReducer, objectKey, source
 }
 
 type crawlTestReducer struct {
-	states map[string]store.DocumentState
-	now    time.Time
+	states  map[string]store.DocumentState
+	parents map[string]string
+	now     time.Time
 }
 
 func newCrawlTestReducer(now time.Time) *crawlTestReducer {
-	return &crawlTestReducer{states: make(map[string]store.DocumentState), now: now}
+	return &crawlTestReducer{
+		states:  make(map[string]store.DocumentState),
+		parents: make(map[string]string),
+		now:     now,
+	}
 }
 
 func (r *crawlTestReducer) ReduceSeenObjects(_ context.Context, input ReduceSeenInput) (ReduceSeenResult, error) {
@@ -418,7 +522,7 @@ func (r *crawlTestReducer) ReduceMissingObjects(_ context.Context, input ReduceM
 		if _, ok := seen[key]; ok || state.SourceState == "DELETED" {
 			continue
 		}
-		if !testCoverageContains(input.Coverage, key) {
+		if !r.testCoverageContains(input.Coverage, key) {
 			continue
 		}
 		state.SourceState = "DELETED"
@@ -432,6 +536,10 @@ func (r *crawlTestReducer) ReduceMissingObjects(_ context.Context, input ReduceM
 }
 
 func (r *crawlTestReducer) seedState(objectKey, sourceVersion, baseline, sourceState string) {
+	r.seedStateWithParent(objectKey, "", sourceVersion, baseline, sourceState)
+}
+
+func (r *crawlTestReducer) seedStateWithParent(objectKey, parentKey, sourceVersion, baseline, sourceState string) {
 	r.states[objectKey] = store.DocumentState{
 		SourceID:            "source-1",
 		BindingID:           "binding-1",
@@ -445,13 +553,30 @@ func (r *crawlTestReducer) seedState(objectKey, sourceVersion, baseline, sourceS
 		CreatedAt:           r.now,
 		UpdatedAt:           r.now,
 	}
+	r.parents[objectKey] = parentKey
 }
 
-func testCoverageContains(coverage Coverage, objectKey string) bool {
+func (r *crawlTestReducer) testCoverageContains(coverage Coverage, objectKey string) bool {
 	if coverage.ScopeType == connector.ScopeTypeFull {
 		return coverage.CoveredTargetRoot
 	}
-	return slices.Contains(coverage.CoveredObjectKeys, objectKey)
+	if slices.Contains(coverage.CoveredObjectKeys, objectKey) || slices.Contains(coverage.CoveredSubtrees, objectKey) {
+		return true
+	}
+	if coverage.ScopeType != connector.ScopeTypePartial {
+		return false
+	}
+	visited := map[string]struct{}{}
+	for key := objectKey; key != ""; key = r.parents[key] {
+		if _, ok := visited[key]; ok {
+			return false
+		}
+		visited[key] = struct{}{}
+		if slices.Contains(coverage.CoveredSubtrees, key) {
+			return true
+		}
+	}
+	return false
 }
 
 func firstTime(value, fallback time.Time) time.Time {
@@ -467,6 +592,7 @@ type crawlTreeConnector struct {
 	delta         bool
 	dualRole      bool
 	deltaItems    []connector.RawObject
+	fetchItems    []connector.RawObject
 	fetchErr      error
 	fetchCalls    int
 	fetchScopes   []connector.ScopeType
@@ -531,6 +657,9 @@ func (c *crawlTreeConnector) FetchPage(_ context.Context, req connector.FetchPag
 		return connector.RawObjectPage{Items: c.deltaItems, Watermark: "delta-2"}, nil
 	}
 	if req.ScopeType == connector.ScopeTypePartial || req.ScopeType == connector.ScopeTypeWatchEvent {
+		if c.fetchItems != nil {
+			return connector.RawObjectPage{Items: c.fetchItems}, nil
+		}
 		if c.deltaItems != nil {
 			return connector.RawObjectPage{Items: c.deltaItems}, nil
 		}

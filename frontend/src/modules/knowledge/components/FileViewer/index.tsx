@@ -35,20 +35,26 @@ const IMAGE_FILE_TYPES = [
 ];
 
 const VIDEO_FILE_TYPES = ["mp4", "webm", "ogg", "ogv", "mov", "m4v"];
+const AUDIO_FILE_TYPES = ["mp3", "wav", "m4a", "aac", "flac"];
 
 const MEDIA_MIME_TYPES: Record<string, string> = {
+  aac: "audio/aac",
   bmp: "image/bmp",
+  flac: "audio/flac",
   gif: "image/gif",
   jpeg: "image/jpeg",
   jpg: "image/jpeg",
+  m4a: "audio/mp4",
   m4v: "video/mp4",
   mov: "video/quicktime",
+  mp3: "audio/mpeg",
   mp4: "video/mp4",
   ogg: "video/ogg",
   ogv: "video/ogg",
   png: "image/png",
   tif: "image/tiff",
   tiff: "image/tiff",
+  wav: "audio/wav",
   webm: "video/webm",
   webp: "image/webp",
 };
@@ -121,6 +127,9 @@ const FileViewer = (props: FileViewerProps) => {
     if (VIDEO_FILE_TYPES.includes(fileSuffix)) {
       return "video";
     }
+    if (AUDIO_FILE_TYPES.includes(fileSuffix)) {
+      return "audio";
+    }
     return "unknown";
   }, [fileSuffix]);
 
@@ -187,7 +196,7 @@ const FileViewer = (props: FileViewerProps) => {
   }, [resolvedFileUrl, getFileData]);
 
   useEffect(() => {
-    if (!fileData || (fileType !== "image" && fileType !== "video")) {
+    if (!fileData || (fileType !== "image" && fileType !== "video" && fileType !== "audio")) {
       setMediaObjectUrl("");
       return;
     }
@@ -278,6 +287,18 @@ const FileViewer = (props: FileViewerProps) => {
             />
           </div>
         ) : null;
+      case "audio":
+        return mediaObjectUrl ? (
+          <div className="file-viewer-media-container">
+            <audio
+              className="file-viewer-media file-viewer-audio"
+              controls
+              preload="metadata"
+              src={mediaObjectUrl}
+              title={props.fileName}
+            />
+          </div>
+        ) : null;
       case "unknown":
       default:
         return (
@@ -298,11 +319,13 @@ const FileViewer = (props: FileViewerProps) => {
   }, [fileData, content, fileType, mediaObjectUrl, meta, props.fileName]);
 
   return (
-    <>
-      {loading && renderLoading}
-      {!loading && !fileData && renderEmpty}
-      {!loading && fileData && renderFile}
-    </>
+    <div className="file-viewer-container">
+      <div className="file-viewer-content">
+        {loading && renderLoading}
+        {!loading && !fileData && renderEmpty}
+        {!loading && fileData && renderFile}
+      </div>
+    </div>
   );
 };
 

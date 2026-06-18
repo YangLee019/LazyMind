@@ -65,14 +65,17 @@ func (e *DefaultEngine) UpdateSource(ctx context.Context, callerID, sourceID str
 type bindingListChanges struct {
 	callerID        string
 	datasetID       string
+	tenantID        string
 	created         []string
 	updated         []string
 	removed         []string
 	createdBindings []preparedBinding
 	updatedBindings []store.BindingUpdateMutation
 	deletedBindings []store.BindingDeleteMutation
+	startWatchers   []store.Binding
+	stopWatchers    []store.Binding
+	reloadWatchers  []store.Binding
 	oldFolderIDs    []string
-	initialSyncs    []store.Binding
 }
 
 func (e *DefaultEngine) prepareBindingList(ctx context.Context, callerID string, src store.Source, inputs []BindingInput, now time.Time) (bindingListChanges, error) {
@@ -82,17 +85,19 @@ func (e *DefaultEngine) prepareBindingList(ctx context.Context, callerID string,
 	}
 	existingByID := bindingByID(existing)
 	seen := make(map[string]struct{}, len(inputs))
-	changes := bindingListChanges{callerID: callerID, datasetID: src.DatasetID}
+	changes := bindingListChanges{callerID: callerID, datasetID: src.DatasetID, tenantID: src.TenantID}
 	for _, input := range inputs {
 		if input.BindingID == "" {
-			prepared, err := e.prepareCreateBinding(ctx, src.SourceID, src.DatasetID, callerID, "", len(changes.createdBindings), input, now)
+			prepared, err := e.prepareCreateBinding(ctx, src.SourceID, src.DatasetID, src.Name, callerID, src.TenantID, "", len(changes.createdBindings), input, now)
 			if err != nil {
 				compensatePreparedCreates(ctx, e, changes.datasetID, changes.callerID, changes.createdBindings)
 				return bindingListChanges{}, err
 			}
 			changes.created = append(changes.created, prepared.binding.BindingID)
 			changes.createdBindings = append(changes.createdBindings, prepared)
-			changes.initialSyncs = append(changes.initialSyncs, prepared.binding)
+			if localWatcherStartable(prepared.binding) {
+				changes.startWatchers = append(changes.startWatchers, prepared.binding)
+			}
 			seen[prepared.binding.BindingID] = struct{}{}
 			continue
 		}
@@ -109,9 +114,9 @@ func (e *DefaultEngine) prepareBindingList(ctx context.Context, callerID string,
 		seen[input.BindingID] = struct{}{}
 		changes.updated = append(changes.updated, input.BindingID)
 		changes.updatedBindings = append(changes.updatedBindings, store.BindingUpdateMutation{Binding: updated, Checkpoint: checkpoint, Cleanup: cleanup})
+		changes = appendWatcherTransition(changes, current, updated)
 		if cleanup.ClearIndexedState {
 			changes.oldFolderIDs = append(changes.oldFolderIDs, cleanup.OldCoreParentDocumentID)
-			changes.initialSyncs = append(changes.initialSyncs, updated)
 		}
 	}
 	for _, binding := range existing {
@@ -123,6 +128,9 @@ func (e *DefaultEngine) prepareBindingList(ctx context.Context, callerID string,
 		}
 		changes.removed = append(changes.removed, binding.BindingID)
 		changes.deletedBindings = append(changes.deletedBindings, store.BindingDeleteMutation{SourceID: binding.SourceID, BindingID: binding.BindingID, DeletedAt: now})
+		if localWatcherStoppable(binding) {
+			changes.stopWatchers = append(changes.stopWatchers, binding)
+		}
 		changes.oldFolderIDs = append(changes.oldFolderIDs, binding.CoreParentDocumentID)
 	}
 	if err := ensureFinalTargetsUnique(existing, changes); err != nil {
@@ -145,9 +153,34 @@ func (e *DefaultEngine) runPostCommitBindingActions(ctx context.Context, changes
 	for _, folderID := range changes.oldFolderIDs {
 		jobErrors = append(jobErrors, e.deleteFolderAsWarning(ctx, changes.datasetID, folderID, changes.callerID)...)
 	}
-	jobIDs, syncErrors := e.triggerInitialSyncs(ctx, changes.initialSyncs)
-	jobErrors = append(jobErrors, syncErrors...)
-	return jobIDs, jobErrors
+	src := store.Source{TenantID: changes.tenantID}
+	jobErrors = append(jobErrors, e.queueLocalWatcherStops(ctx, src, changes.stopWatchers)...)
+	for _, binding := range changes.reloadWatchers {
+		if err := e.queueLocalWatcherCommand(ctx, src, binding, agentCommandReloadSource, e.clock().UTC()); err != nil {
+			jobErrors = append(jobErrors, localWatcherCommandError(binding, agentCommandReloadSource, err))
+		}
+	}
+	jobErrors = append(jobErrors, e.queueLocalWatcherStarts(ctx, src, changes.startWatchers)...)
+	return nil, jobErrors
+}
+
+func appendWatcherTransition(changes bindingListChanges, current, updated store.Binding) bindingListChanges {
+	currentStartable := localWatcherStartable(current)
+	updatedStartable := localWatcherStartable(updated)
+	switch {
+	case currentStartable && !updatedStartable:
+		changes.stopWatchers = append(changes.stopWatchers, current)
+	case !currentStartable && updatedStartable:
+		changes.startWatchers = append(changes.startWatchers, updated)
+	case currentStartable && updatedStartable && localWatcherRuntimeChanged(current, updated):
+		if current.AgentID == updated.AgentID {
+			changes.reloadWatchers = append(changes.reloadWatchers, updated)
+			break
+		}
+		changes.stopWatchers = append(changes.stopWatchers, current)
+		changes.startWatchers = append(changes.startWatchers, updated)
+	}
+	return changes
 }
 
 func compensatePreparedCreates(ctx context.Context, e *DefaultEngine, datasetID, callerID string, bindings []preparedBinding) {

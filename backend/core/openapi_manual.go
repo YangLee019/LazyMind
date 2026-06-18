@@ -252,19 +252,29 @@ func manualSchemas() map[string]any {
 			prop("status", strSchema()),
 			prop("error_message", strSchema()),
 		),
-		"ListTasksResponse":                obj(prop("tasks", array(refSchema("TaskResponse"))), prop("total_size", intSchema()), prop("next_page_token", strSchema())),
-		"PromptRequest":                    objReq([]string{"display_name", "content"}, prop("display_name", strSchema()), prop("content", strSchema())),
-		"PromptPatchRequest":               obj(prop("display_name", strSchema()), prop("content", strSchema())),
-		"PromptPolishRequest":              objReq([]string{"content", "user_instruct"}, prop("content", strSchema()), prop("user_instruct", strSchema())),
-		"PromptPolishResponse":             obj(prop("content", strSchema())),
-		"PromptItem":                       obj(prop("name", strSchema()), prop("id", strSchema()), prop("content", strSchema()), prop("display_name", strSchema()), prop("is_default", boolSchema())),
-		"PromptListResponse":               obj(prop("prompts", array(refSchema("PromptItem"))), prop("next_page_token", strSchema()), prop("total", int64Schema())),
-		"ConversationResumeRequest":        objReq([]string{"conversation_id"}, prop("conversation_id", strSchema()), prop("history_id", strSchema())),
-		"ConversationStopRequest":          objReq([]string{"conversation_id"}, prop("conversation_id", strSchema()), prop("history_id", strSchema())),
-		"ConversationSetHistoryRequest":    objReq([]string{"set_history_id", "deleted_history_id"}, prop("set_history_id", strSchema()), prop("deleted_history_id", strSchema())),
-		"ConversationBatchDeleteRequest":   objReq([]string{"conversation_ids"}, prop("conversation_ids", array(strSchema()))),
-		"ConversationBatchDeleteResponse":  obj(prop("deleted_count", intSchema()), prop("deleted_ids", array(strSchema()))),
-		"ConversationFeedbackRequest":      objReq([]string{"history_id", "type"}, prop("history_id", strSchema()), prop("type", intSchema()), prop("reason", strSchema()), prop("expected_answer", strSchema())),
+		"ListTasksResponse":               obj(prop("tasks", array(refSchema("TaskResponse"))), prop("total_size", intSchema()), prop("next_page_token", strSchema())),
+		"PromptRequest":                   objReq([]string{"display_name", "content"}, prop("display_name", strSchema()), prop("content", strSchema())),
+		"PromptPatchRequest":              obj(prop("display_name", strSchema()), prop("content", strSchema())),
+		"PromptPolishRequest":             objReq([]string{"content", "user_instruct"}, prop("content", strSchema()), prop("user_instruct", strSchema())),
+		"PromptPolishResponse":            obj(prop("content", strSchema())),
+		"PromptItem":                      obj(prop("name", strSchema()), prop("id", strSchema()), prop("content", strSchema()), prop("display_name", strSchema()), prop("is_default", boolSchema())),
+		"PromptListResponse":              obj(prop("prompts", array(refSchema("PromptItem"))), prop("next_page_token", strSchema()), prop("total", int64Schema())),
+		"ToolMethod":                      obj(prop("name", strSchema()), prop("summary", strSchema())),
+		"ToolGroup":                       obj(prop("name", strSchema()), prop("label", strSchema()), prop("description", strSchema()), prop("methods", array(refSchema("ToolMethod"))), prop("can_disable", boolSchema()), prop("active", boolSchema()), prop("disabled", boolSchema())),
+		"ToolListResponse":                obj(prop("tool_groups", array(refSchema("ToolGroup"))), prop("page", intSchema()), prop("page_size", intSchema()), prop("total", intSchema())),
+		"ToolStateResponse":               obj(prop("name", strSchema()), prop("disabled", boolSchema())),
+		"ConversationResumeRequest":       objReq([]string{"conversation_id"}, prop("conversation_id", strSchema()), prop("history_id", strSchema())),
+		"ConversationStopRequest":         objReq([]string{"conversation_id"}, prop("conversation_id", strSchema()), prop("history_id", strSchema())),
+		"ConversationSetHistoryRequest":   objReq([]string{"set_history_id", "deleted_history_id"}, prop("set_history_id", strSchema()), prop("deleted_history_id", strSchema())),
+		"ConversationBatchDeleteRequest":  objReq([]string{"conversation_ids"}, prop("conversation_ids", array(strSchema()))),
+		"ConversationBatchDeleteResponse": obj(prop("deleted_count", intSchema()), prop("deleted_ids", array(strSchema()))),
+		"ConversationFeedbackRequest": objReq(
+			[]string{"history_id", "type"},
+			prop("history_id", strSchema()),
+			prop("type", feedbackTypeSchema()),
+			prop("reason", strSchema()),
+			prop("expected_answer", strSchema()),
+		),
 		"ConversationSwitchStatusRequest":  objReq([]string{"status"}, prop("status", intSchema())),
 		"ConversationSwitchStatusResponse": obj(prop("status", intSchema())),
 		"ConversationChatStatusResponse":   obj(prop("is_generating", boolSchema())),
@@ -372,7 +382,7 @@ func manualPaths() map[string]any {
 		"/temp/uploads/{upload_id}:complete":            map[string]any{"post": op("Complete temp upload", nil, jsonBody(refSchema("CompleteUploadRequest"), false), response(200, "Complete uploadtext", refSchema("CompleteUploadResponse")))},
 		"/temp/uploads/{upload_id}:abort":               map[string]any{"post": op("Abort temp upload", nil, jsonBody(refSchema("AbortUploadRequest"), false), response(200, "Abort uploadtext", refSchema("AbortUploadResponse")))},
 		"/prompts": map[string]any{
-			"get":  op("Prompt list", queryParams(param("query", "page_size", false, intSchema()), param("query", "page_token", false, strSchema())), nil, response(200, "Prompt list", refSchema("PromptListResponse"))),
+			"get":  op("Prompt list", queryParams(param("query", "page_size", false, intSchema()), param("query", "page_token", false, strSchema()), param("query", "keyword", false, strSchema())), nil, response(200, "Prompt list", refSchema("PromptListResponse"))),
 			"post": op("Create prompt", nil, jsonBody(refSchema("PromptRequest"), true), response(200, "Created prompt", refSchema("PromptItem"))),
 		},
 		"/prompts:polish": map[string]any{"post": op("Polish prompt", nil, jsonBody(refSchema("PromptPolishRequest"), true), response(200, "Polished prompt", refSchema("PromptPolishResponse")))},
@@ -383,6 +393,9 @@ func manualPaths() map[string]any {
 		},
 		"/prompts/{name}:setDefault":              map[string]any{"post": op("Set as default prompt", nil, nil, response(200, "Set successfully", refSchema("EmptyObject")))},
 		"/prompts/{name}:unsetDefault":            map[string]any{"post": op("Unset default prompt", nil, nil, response(200, "Unset successfully", refSchema("EmptyObject")))},
+		"/tools":                                  map[string]any{"get": op("Tool list", queryParams(param("query", "keyword", false, strSchema()), param("query", "page", false, intSchema()), param("query", "page_size", false, intSchema())), nil, response(200, "Tool list", refSchema("ToolListResponse")))},
+		"/tools/{tool_name}:disable":              map[string]any{"post": op("Disable tool", nil, nil, response(200, "Tool disabled", refSchema("ToolStateResponse")))},
+		"/tools/{tool_name}:enable":               map[string]any{"post": op("Enable tool", nil, nil, response(200, "Tool enabled", refSchema("ToolStateResponse")))},
 		"/conversations:resumeChat":               map[string]any{"post": sseOp("Resume conversation stream", jsonBody(refSchema("ConversationResumeRequest"), true), response(200, "SSE streaming response item is ChatChunkResponse wrapped by result", refSchema("ChatChunkResponse")))},
 		"/conversations:stopChatGeneration":       map[string]any{"post": op("Stop conversation generation", nil, jsonBody(refSchema("ConversationStopRequest"), true), response(200, "Stopped successfully", refSchema("EmptyObject")))},
 		"/conversations/{conversation_id}:status": map[string]any{"get": op("Get conversation status", nil, nil, response(200, "Conversation status", refSchema("ConversationChatStatusResponse")))},
@@ -457,6 +470,25 @@ func intSchema() map[string]any                              { return map[string
 func int64Schema() map[string]any                            { return map[string]any{"type": "integer", "format": "int64"} }
 func dateTimeSchema() map[string]any                         { return map[string]any{"type": "string", "format": "date-time"} }
 func array(item map[string]any) map[string]any               { return map[string]any{"type": "array", "items": item} }
+func feedbackTypeSchema() map[string]any {
+	return map[string]any{
+		"description": "Feedback type. 0 or FEED_BACK_TYPE_UNSPECIFIED cancels feedback; 1 or FEED_BACK_TYPE_LIKE likes; 2 or FEED_BACK_TYPE_UNLIKE dislikes. Cancelling or changing away from unlike clears reason and expected_answer.",
+		"oneOf": []any{
+			map[string]any{
+				"type": "integer",
+				"enum": []any{0, 1, 2},
+			},
+			map[string]any{
+				"type": "string",
+				"enum": []any{
+					"FEED_BACK_TYPE_UNSPECIFIED",
+					"FEED_BACK_TYPE_LIKE",
+					"FEED_BACK_TYPE_UNLIKE",
+				},
+			},
+		},
+	}
+}
 func refSchema(name string) map[string]any {
 	return map[string]any{"$ref": "#/components/schemas/" + name}
 }

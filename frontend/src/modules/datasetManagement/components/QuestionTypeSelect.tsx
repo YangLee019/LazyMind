@@ -1,5 +1,6 @@
-import { Select } from "antd";
-import { questionTypeOptions } from "../shared";
+import { AutoComplete } from "antd";
+import { useTranslation } from "react-i18next";
+import { questionTypeI18nKeys, questionTypeOptions } from "../shared";
 
 interface QuestionTypeSelectProps {
   value?: string;
@@ -14,23 +15,27 @@ export default function QuestionTypeSelect({
   value,
   onChange,
   onBlur,
-  placeholder = "请选择问题类型",
+  placeholder,
   allowClear,
   options,
 }: QuestionTypeSelectProps) {
-  const resolvedOptions =
-    options && options.length > 0 ? options : questionTypeOptions;
+  const { t } = useTranslation();
+  const resolvedOptions = options ? options : questionTypeOptions;
 
   return (
-    <Select
+    <AutoComplete
       allowClear={allowClear}
-      showSearch
       value={value}
-      onChange={onChange}
+      onChange={(nextValue) => onChange?.(nextValue)}
       onBlur={onBlur}
-      placeholder={placeholder}
-      options={resolvedOptions.map((item) => ({ label: item, value: item }))}
-      optionFilterProp="label"
+      placeholder={placeholder || t("datasetManagement.detail.placeholders.questionType")}
+      options={resolvedOptions.map((item) => ({
+        label: t(questionTypeI18nKeys[item] || item),
+        value: item,
+      }))}
+      filterOption={(inputValue, option) =>
+        `${option?.label || ""}`.toLowerCase().includes(inputValue.toLowerCase())
+      }
     />
   );
 }

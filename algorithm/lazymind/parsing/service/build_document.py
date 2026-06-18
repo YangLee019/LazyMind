@@ -1,9 +1,17 @@
 import lazyllm
 from lazyllm.tracing import set_trace_context
 from lazyllm import AutoModel
-from lazyllm.tools.rag import Document, LLMParser
+from lazyllm.tools.rag import AdaptiveTransform, CodeSplitter, Document, LLMParser, TransformArgs
 from lazyllm.tools.rag.doc_impl import NodeGroupType
 from lazyllm.tools.rag.parsing_service import DocumentProcessor
+from lazyllm.tools.rag.readers import (
+    EpubReader,
+    HWPReader,
+    IPYNBReader,
+    MboxReader,
+    PandasCSVReader,
+    PandasExcelReader
+)
 from lazyllm.tools.rag.readers.ocrReader import DynamicPDFReader
 
 from lazymind.model_config import get_dynamic_role_slot_map
@@ -12,6 +20,19 @@ from lazymind.parsing.engine.readers import ImageEmbReader, VideoReader
 from lazymind.parsing.engine.transform import GeneralParser, LineSplitter, NodeParser
 
 ALGO_ID = 'general_algo'
+_CODE_CHUNK_SIZE = 512
+_CODE_OVERLAP = 0
+_CODE_FILE_PATTERNS = (
+    ('*.json', 'json'),
+    ('*.jsonl', 'jsonl'),
+    ('*.yaml', 'yaml'),
+    ('*.yml', 'yml'),
+    ('*.xml', 'xml'),
+    ('*.html', 'html'),
+    ('*.htm', 'htm'),
+    ('*.py', 'python'),
+    ('*.ipynb', 'python'),
+)
 
 
 def _quiet_trace(kbs):
@@ -32,9 +53,32 @@ def _build_store_config(index_kwargs):
     milvus_uri = _cfg['milvus_uri']
     if not milvus_uri:
         raise ValueError('LAZYMIND_MILVUS_URI is required')
-    opensearch_uri = _cfg['opensearch_uri']
-    if not opensearch_uri:
-        raise ValueError('LAZYMIND_OPENSEARCH_URI is required')
+
+    store_type = _cfg['segment_store_type']
+    uri_or_path = _cfg['segment_store_uri_or_path']
+    if store_type == 'SQLiteStore':
+        if not uri_or_path:
+            raise ValueError('LAZYMIND_SEGMENT_STORE_URI_OR_PATH is required for SQLite segment store')
+        segment_store = {'type': 'SQLiteStore', 'kwargs': {'db_path': uri_or_path}}
+    elif store_type == 'opensearch':
+        if not uri_or_path:
+            raise ValueError('LAZYMIND_SEGMENT_STORE_URI_OR_PATH is required for OpenSearch segment store')
+        segment_store = {
+            'type': store_type,
+            'kwargs': {
+                'uris': uri_or_path,
+                'client_kwargs': {
+                    'http_compress': True,
+                    'use_ssl': True,
+                    'verify_certs': False,
+                    'user': _cfg['segment_store_user'],
+                    'password': _cfg['segment_store_password'],
+                },
+            },
+        }
+    else:
+        raise ValueError(f'Unsupported segment store type: {store_type!r}')
+
     return {
         'vector_store': {
             'type': 'milvus',
@@ -43,20 +87,27 @@ def _build_store_config(index_kwargs):
                 'index_kwargs': index_kwargs,
             },
         },
-        'segment_store': {
-            'type': 'opensearch',
-            'kwargs': {
-                'uris': opensearch_uri,
-                'client_kwargs': {
-                    'http_compress': True,
-                    'use_ssl': True,
-                    'verify_certs': False,
-                    'user': _cfg['opensearch_user'],
-                    'password': _cfg['opensearch_password'] or 'LazyRAG_OpenSearch123!',
-                },
-            },
-        },
+        'segment_store': segment_store,
     }
+
+
+def _build_code_transform():
+    code_kwargs = dict(chunk_size=_CODE_CHUNK_SIZE, overlap=_CODE_OVERLAP)
+    return AdaptiveTransform([
+        TransformArgs(f=CodeSplitter, pattern=pattern, kwargs={**code_kwargs, 'filetype': filetype})
+        for pattern, filetype in _CODE_FILE_PATTERNS
+    ] + [TransformArgs(f=lambda _: [], name='skip_non_code_files')])
+
+
+def _build_block_transform():
+    return AdaptiveTransform(TransformArgs(f=GeneralParser, kwargs={'max_length': 2048, 'split_by': '\n'}))
+
+
+def _build_line_transform():
+    return AdaptiveTransform([
+        TransformArgs(f=lambda _: [], pattern=pattern, name='skip_line_for_code_files')
+        for pattern, _ in _CODE_FILE_PATTERNS
+    ] + [TransformArgs(f=LineSplitter)])
 
 
 def _build_pdf_reader():
@@ -65,6 +116,26 @@ def _build_pdf_reader():
         post_func=NodeParser(),
         timeout=3600,
     )
+
+
+def _register_document_readers(docs: Document) -> None:
+    pdf_reader = _build_pdf_reader()
+    docs.add_reader('*.pdf', pdf_reader)
+    docs.add_reader('*.hwp', HWPReader())
+
+    # mineru ppt reader.
+    docs.add_reader('*.pptx', pdf_reader)
+    docs.add_reader('*.ppt', pdf_reader)
+    docs.add_reader('*.pptm', pdf_reader)
+
+    docs.add_reader('*.ipynb', IPYNBReader())
+    docs.add_reader('*.epub', EpubReader())
+    docs.add_reader('*.mbox', MboxReader())
+    docs.add_reader('*.csv', PandasCSVReader())
+
+    excel_reader = PandasExcelReader()
+    docs.add_reader('*.xls', excel_reader)
+    docs.add_reader('*.xlsx', excel_reader)
 
 
 def reset_stores() -> None:
@@ -83,7 +154,7 @@ def reset_stores() -> None:
     '''
     import re
     from lazyllm import LOG
-    from lazyllm.tools.rag.store import MilvusStore, OpenSearchStore
+    from lazyllm.tools.rag.store import MilvusStore, OpenSearchStore, SQLiteStore
 
     LOG.warning(f'[build_document] Clearing vector/segment stores for algo "{ALGO_ID}"')
 
@@ -92,11 +163,12 @@ def reset_stores() -> None:
     def _col(group: str) -> str:
         return _pat.sub('_', f'col_{group}'.lower()).strip('_')
 
-    activated_groups = ['block', 'line', 'doc-summary', 'image', '__lazyllm_root__', '__lazyllm_image__']
+    activated_groups = ['block', 'line', 'code', 'doc-summary', 'image', '__lazyllm_root__', '__lazyllm_image__']
     store_conf = _build_store_config(EMBED_INDEX_KWARGS)
 
     milvus_cfg = (store_conf.get('vector_store') or {}).get('kwargs', {})
-    opensearch_cfg = (store_conf.get('segment_store') or {}).get('kwargs', {})
+    seg_cfg = (store_conf.get('segment_store') or {}).get('kwargs', {})
+    seg_type = (store_conf.get('segment_store') or {}).get('type', '')
 
     if milvus_cfg.get('uri'):
         milvus = MilvusStore(**{k: v for k, v in milvus_cfg.items() if k != 'index_kwargs'})
@@ -104,8 +176,13 @@ def reset_stores() -> None:
             milvus.delete(_col(group))
         LOG.warning(f'[build_document] Milvus collections dropped for algo "{ALGO_ID}"')
 
-    if opensearch_cfg.get('uris'):
-        opensearch = OpenSearchStore(**opensearch_cfg)
+    if seg_type == 'SQLiteStore' and seg_cfg.get('db_path'):
+        sqlite = SQLiteStore(**seg_cfg)
+        for group in activated_groups:
+            sqlite.delete(_col(group))
+        LOG.warning(f'[build_document] SQLite collections dropped for algo "{ALGO_ID}"')
+    elif seg_cfg.get('uris'):
+        opensearch = OpenSearchStore(**seg_cfg)
         for group in activated_groups:
             opensearch.delete(_col(group))
         LOG.warning(f'[build_document] OpenSearch indices dropped for algo "{ALGO_ID}"')
@@ -162,7 +239,7 @@ def drop_lazyllm_tables() -> None:
         LOG.error(f'[build_document] Failed to drop lazyllm tables: {e}')
 
 
-def build_document() -> Document:
+def build_document(algo_id: str = ALGO_ID, *, serve: bool = True) -> Document:
     processor_url = _cfg['document_processor_url']
     server_port = get_algo_server_port()
     embed = {k: AutoModel(model=k) for k in EMBED_KEYS}
@@ -174,26 +251,31 @@ def build_document() -> Document:
 
     docs = Document(
         dataset_path=None,
-        name=ALGO_ID,
+        name=algo_id,
         embed=embed,
         manager=processor,
         doc_fields=[],
     )
 
-    docs.add_reader('*.pdf', _build_pdf_reader())
+    _register_document_readers(docs)
 
     image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif')
     image_reader = ImageEmbReader()
-    media_reader = VideoReader()
+
+    # Pass an STT model, otherwise openai-whisper will be used by default.
+    # For optimal performance, openai-whisper is recommended to run on a GPU server.
+    media_reader = VideoReader(model_role='speech_to_text')
     for ext in image_extensions:
         docs.add_reader(f'*{ext}', image_reader)
     docs.add_reader('*.mp3', media_reader)
     docs.add_reader('*.mp4', media_reader)
 
     docs.create_node_group(name='block', display_name='paragraph slice',
-                           group_type=NodeGroupType.CHUNK, transform=GeneralParser(max_length=2048, split_by='\n'))
+                           group_type=NodeGroupType.CHUNK, transform=_build_block_transform())
     docs.create_node_group(name='line', display_name='sentence slice',
-                           group_type=NodeGroupType.CHUNK, transform=LineSplitter, parent='block')
+                           group_type=NodeGroupType.CHUNK, transform=_build_line_transform(), parent='block')
+    docs.create_node_group(name='code', display_name='code slice',
+                           group_type=NodeGroupType.CODE, transform=_build_code_transform())
     docs.create_node_group(
         name='doc-summary',
         display_name='document summary',
@@ -209,9 +291,16 @@ def build_document() -> Document:
     docs.activate_group('image', embed_keys=EMBED_IMAGE)
     docs.activate_group('block', embed_keys=[EMBED_MAIN])
     docs.activate_group('line', embed_keys=[EMBED_MAIN])
+    docs.activate_group('code', embed_keys=[EMBED_MAIN])
     docs.activate_group('doc-summary', embed_keys=[EMBED_MAIN])
-    docs._manager._kbs = lazyllm.ServerModule(
-        _quiet_trace(docs._manager._kbs),
-        port=server_port,
-    )
+    if serve:
+        docs._manager._kbs = lazyllm.ServerModule(_quiet_trace(docs._manager._kbs), port=server_port)
     return docs
+
+
+def register_parser_algorithm(algo_id: str) -> None:
+    build_document(algo_id, serve=False).start()
+
+
+def drop_parser_algorithm(algo_id: str) -> None:
+    DocumentProcessor(url=_cfg['document_processor_url']).drop_algorithm(algo_id)

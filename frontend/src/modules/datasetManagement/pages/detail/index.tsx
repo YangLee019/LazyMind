@@ -33,6 +33,7 @@ import {
   SettingOutlined,
 } from "@ant-design/icons";
 import { useNavigate, useParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import {
   batchDeleteDatasetItems,
   createDatasetItem,
@@ -40,9 +41,9 @@ import {
   findKnowledgeBaseDocumentById,
   getDataset,
   importDatasetItems,
+  listDatasetQuestionTypes,
   listDatasetItems,
   type KnowledgeDocumentOption,
-  listQuestionTypes,
   mergeKnowledgeDocumentOptions,
   searchKnowledgeBaseDocuments,
   updateDatasetItem,
@@ -68,7 +69,11 @@ import type {
   DatasetItemSource,
   DatasetListItem,
 } from "../../shared";
-import { formatDateTime, sourceLabelMap } from "../../shared";
+import {
+  datasetItemFieldI18nKeys,
+  formatDateTime,
+  sourceLabelI18nKeys,
+} from "../../shared";
 import {
   joinListField,
   validateRequiredDatasetItem,
@@ -91,7 +96,7 @@ const DEFAULT_COLUMN_WIDTHS = {
   key_points: 220,
   reference_context: 260,
   reference_doc: 160,
-  generate_reason: 220,
+  is_deleted: 120,
   source: 100,
   updated_at: 150,
   actions: 90,
@@ -104,8 +109,7 @@ type EditableDatasetItemField =
   | "ground_truth"
   | "key_points"
   | "reference_context"
-  | "reference_doc"
-  | "generate_reason";
+  | "reference_doc";
 type ActiveEditableCell = {
   itemId: string;
   field: EditableDatasetItemField;
@@ -117,7 +121,12 @@ type DocumentSearchState = {
   nextPageToken?: string;
   totalSize?: number;
 };
-type ConfigurableColumnKey = Exclude<ResizableColumnKey, "actions">;
+type ConfigurableColumnKey = Exclude<ResizableColumnKey, "actions" | "is_deleted">;
+const REQUIRED_VISIBLE_COLUMN_KEYS: ConfigurableColumnKey[] = [
+  "question",
+  "question_type",
+  "ground_truth",
+];
 type ReferenceDocumentPreview = {
   datasetId: string;
   documentId: string;
@@ -151,24 +160,43 @@ type ReferenceContextValue = {
   parts: ReferenceContextPart[];
 };
 
+function createReferenceChunkSelectorState(): ReferenceChunkSelectorState {
+  return {
+    open: false,
+    loading: false,
+    confirming: false,
+    error: "",
+    itemId: "",
+    documentName: "",
+    documentPreviewUrl: "",
+    segmentGroup: "",
+    chunks: [],
+    selectedChunkIds: [],
+  };
+}
+
 const CONFIGURABLE_COLUMN_OPTIONS: Array<{
-  label: string;
+  labelKey: string;
   value: ConfigurableColumnKey;
+  disabled?: boolean;
 }> = [
-  { label: "问题", value: "question" },
-  { label: "问题类型", value: "question_type" },
-  { label: "标准答案", value: "ground_truth" },
-  { label: "答案要点", value: "key_points" },
-  { label: "参考文档", value: "reference_doc" },
-  { label: "参考上下文", value: "reference_context" },
-  { label: "生成依据", value: "generate_reason" },
-  { label: "来源", value: "source" },
-  { label: "更新时间", value: "updated_at" },
+  { labelKey: datasetItemFieldI18nKeys.question, value: "question", disabled: true },
+  { labelKey: datasetItemFieldI18nKeys.question_type, value: "question_type", disabled: true },
+  { labelKey: datasetItemFieldI18nKeys.ground_truth, value: "ground_truth", disabled: true },
+  { labelKey: datasetItemFieldI18nKeys.key_points, value: "key_points" },
+  { labelKey: datasetItemFieldI18nKeys.reference_doc, value: "reference_doc" },
+  { labelKey: datasetItemFieldI18nKeys.reference_context, value: "reference_context" },
+  { labelKey: "datasetManagement.fields.source", value: "source" },
+  { labelKey: "datasetManagement.fields.updatedAt", value: "updated_at" },
 ];
 
-const DEFAULT_VISIBLE_COLUMN_KEYS = CONFIGURABLE_COLUMN_OPTIONS.map(
-  (option) => option.value,
-);
+const DEFAULT_VISIBLE_COLUMN_KEYS = [
+  ...CONFIGURABLE_COLUMN_OPTIONS.map((option) => option.value),
+];
+
+function normalizeVisibleColumnKeys(keys: ConfigurableColumnKey[]) {
+  return Array.from(new Set([...REQUIRED_VISIBLE_COLUMN_KEYS, ...keys]));
+}
 
 const editableFieldColumnMap: Record<EditableDatasetItemField, ConfigurableColumnKey> = {
   question: "question",
@@ -177,8 +205,14 @@ const editableFieldColumnMap: Record<EditableDatasetItemField, ConfigurableColum
   key_points: "key_points",
   reference_context: "reference_context",
   reference_doc: "reference_doc",
-  generate_reason: "generate_reason",
 };
+
+const renderRequiredColumnTitle = (title: string) => (
+  <span className="dataset-required-column-title">
+    <span className="dataset-required-column-mark" aria-hidden="true">*</span>
+    {title}
+  </span>
+);
 
 type ResizableHeaderCellProps = ThHTMLAttributes<HTMLTableCellElement> & {
   columnKey?: ResizableColumnKey;
@@ -443,7 +477,11 @@ function removeReferenceContextPart(raw: string | undefined, partIndex: number) 
   });
 }
 
-function renderReferenceContextParts(raw: string | undefined, placeholder: string) {
+function renderReferenceContextParts(
+  raw: string | undefined,
+  placeholder: string,
+  formatChunkLabel: (index: number) => string,
+) {
   const value = parseReferenceContextValue(raw);
   if (value.parts.length === 0) {
     return <span className="dataset-inline-placeholder">{placeholder}</span>;
@@ -467,7 +505,7 @@ function renderReferenceContextParts(raw: string | undefined, placeholder: strin
               }
             >
               <span className="dataset-reference-context-chip">
-                引用片段{chunkIndex}
+                {formatChunkLabel(chunkIndex)}
               </span>
             </Popover>
           );
@@ -558,6 +596,62 @@ function placeCaretAtEnd(element: HTMLElement) {
   selection.addRange(range);
 }
 
+function escapeHtml(value?: string) {
+  return `${value || ""}`
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function escapeHtmlAttribute(value?: string) {
+  return escapeHtml(value)
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/\r/g, "&#13;")
+    .replace(/\n/g, "&#10;");
+}
+
+function buildReferenceContextEditorHtml(
+  value: string,
+  formatChunkLabel: (index: number) => string,
+  formatDeleteChunkAria: (index: number) => string,
+) {
+  // contentEditable mutates children directly, so keep editor internals out of React reconciliation.
+  const editorValue = referenceContextEditorValue(value);
+  let chunkIndex = 0;
+
+  return editorValue.parts
+    .map((part, index) => {
+      if (part.type === "chunk") {
+        chunkIndex += 1;
+        return [
+          `<span contenteditable="false"`,
+          ` data-reference-context-part="chunk"`,
+          ` data-reference-context-part-index="${index}"`,
+          ` data-id="${escapeHtmlAttribute(part.id)}"`,
+          ` data-content="${escapeHtmlAttribute(part.content)}"`,
+          ` title="${escapeHtmlAttribute(part.content)}"`,
+          ` class="dataset-reference-context-chip">`,
+          escapeHtml(formatChunkLabel(chunkIndex)),
+          `<button type="button"`,
+          ` class="dataset-reference-context-chip-remove"`,
+          ` aria-label="${escapeHtmlAttribute(formatDeleteChunkAria(chunkIndex))}"`,
+          ` data-reference-context-remove-part="${index}">&times;</button>`,
+          `</span>`,
+        ].join("");
+      }
+
+      return [
+        `<span data-reference-context-part-index="${index}"`,
+        ` data-reference-context-text-index="${index}"`,
+        ` class="dataset-reference-context-editor-text">`,
+        escapeHtml(part.content) || "&#8203;",
+        `</span>`,
+      ].join("");
+    })
+    .join("");
+}
+
 function ReferenceContextInlineEditor({
   value,
   placeholder,
@@ -566,6 +660,8 @@ function ReferenceContextInlineEditor({
   onBlur,
   onInsertIndexChange,
   onRemovePart,
+  formatChunkLabel,
+  formatDeleteChunkAria,
 }: {
   value: string;
   placeholder: string;
@@ -574,9 +670,16 @@ function ReferenceContextInlineEditor({
   onBlur: () => void;
   onInsertIndexChange: (index?: number) => void;
   onRemovePart: (index: number) => void;
+  formatChunkLabel: (index: number) => string;
+  formatDeleteChunkAria: (index: number) => string;
 }) {
   const editorRef = useRef<HTMLDivElement | null>(null);
   const editorValue = referenceContextEditorValue(value);
+  const editorHtml = buildReferenceContextEditorHtml(
+    value,
+    formatChunkLabel,
+    formatDeleteChunkAria,
+  );
 
   useEffect(() => {
     if (autoFocus && editorRef.current) {
@@ -622,6 +725,17 @@ function ReferenceContextInlineEditor({
     }
     const partNode = element.closest<HTMLElement>("[data-reference-context-part-index]");
     const index = Number(partNode?.dataset.referenceContextPartIndex);
+    return Number.isFinite(index) ? index : undefined;
+  };
+
+  const removePartIndexFromTarget = (target: EventTarget | null) => {
+    if (!(target instanceof HTMLElement)) {
+      return undefined;
+    }
+    const removeButton = target.closest<HTMLElement>(
+      "[data-reference-context-remove-part]",
+    );
+    const index = Number(removeButton?.dataset.referenceContextRemovePart);
     return Number.isFinite(index) ? index : undefined;
   };
 
@@ -677,7 +791,6 @@ function ReferenceContextInlineEditor({
     onRemovePart(chunkIndexToRemove);
   };
 
-  let chunkIndex = 0;
   const isEmpty = editorValue.parts.length === 0;
   return (
     <div
@@ -696,64 +809,25 @@ function ReferenceContextInlineEditor({
       }}
       onKeyUp={(event) => updateInsertIndex(event.target)}
       onKeyDown={handleKeyDown}
+      onMouseDown={(event) => {
+        if (removePartIndexFromTarget(event.target) !== undefined) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+      }}
+      onClick={(event) => {
+        const index = removePartIndexFromTarget(event.target);
+        if (index === undefined) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        onRemovePart(index);
+      }}
       onMouseUp={(event) => updateInsertIndex(event.target)}
       onPaste={handlePaste}
-    >
-      {editorValue.parts.map((part, index) => {
-        if (part.type === "chunk") {
-          chunkIndex += 1;
-          return (
-            <Popover
-              key={`${part.id || index}-${chunkIndex}`}
-              trigger="hover"
-              placement="topLeft"
-              content={
-                <div className="dataset-reference-context-popover">
-                  {part.content}
-                </div>
-              }
-            >
-              <span
-                contentEditable={false}
-                data-reference-context-part="chunk"
-                data-reference-context-part-index={index}
-                data-id={part.id}
-                data-content={part.content}
-                className="dataset-reference-context-chip"
-              >
-                引用片段{chunkIndex}
-                <button
-                  type="button"
-                  className="dataset-reference-context-chip-remove"
-                  aria-label={`删除引用片段${chunkIndex}`}
-                  onMouseDown={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                  }}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    onRemovePart(index);
-                  }}
-                >
-                  <CloseOutlined />
-                </button>
-              </span>
-            </Popover>
-          );
-        }
-        return (
-          <span
-            key={`text-${index}`}
-            data-reference-context-part-index={index}
-            data-reference-context-text-index={index}
-            className="dataset-reference-context-editor-text"
-          >
-            {part.content || "\u200b"}
-          </span>
-        );
-      })}
-    </div>
+      dangerouslySetInnerHTML={{ __html: editorHtml }}
+    />
   );
 }
 
@@ -779,6 +853,9 @@ function mergeHiddenItemFields(
 ): DatasetItemFormValues {
   const currentReferenceDocIDs = joinListField(item.reference_doc_ids);
   const nextReferenceDocIDs = values.reference_doc_ids || "";
+  const currentReferenceContext = `${item.reference_context || ""}`.trim();
+  const nextReferenceContext = `${values.reference_context || ""}`.trim();
+  const referenceContextChanged = nextReferenceContext !== currentReferenceContext;
   const referenceDocChanged =
     `${values.reference_doc || ""}`.trim() !== `${item.reference_doc || ""}`.trim() ||
     (Boolean(nextReferenceDocIDs.trim()) &&
@@ -790,7 +867,7 @@ function mergeHiddenItemFields(
     reference_doc_ids: referenceDocChanged
       ? nextReferenceDocIDs
       : nextReferenceDocIDs || currentReferenceDocIDs,
-    reference_chunk_ids: referenceDocChanged
+    reference_chunk_ids: referenceDocChanged || referenceContextChanged
       ? values.reference_chunk_ids || ""
       : values.reference_chunk_ids || joinListField(item.reference_chunk_ids),
     is_deleted: Boolean(item.is_deleted),
@@ -798,6 +875,7 @@ function mergeHiddenItemFields(
 }
 
 export default function DatasetDetailPage() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const { datasetId = "" } = useParams();
   const [dataset, setDataset] = useState<DatasetListItem | null>(null);
@@ -821,44 +899,89 @@ export default function DatasetDetailPage() {
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<ConfigurableColumnKey[]>(
     DEFAULT_VISIBLE_COLUMN_KEYS,
   );
+  const columnSettingOptions = useMemo(
+    () =>
+      CONFIGURABLE_COLUMN_OPTIONS.map((option) => ({
+        label: t(option.labelKey),
+        value: option.value,
+        disabled: option.disabled,
+      })),
+    [t],
+  );
+  const effectiveVisibleColumnKeys = useMemo(
+    () => normalizeVisibleColumnKeys(visibleColumnKeys),
+    [visibleColumnKeys],
+  );
   const [headerHeight, setHeaderHeight] = useState(DEFAULT_HEADER_HEIGHT);
   const [rowHeight, setRowHeight] = useState(DEFAULT_ROW_HEIGHT);
   const [documentSearchState, setDocumentSearchState] = useState<
     Record<string, DocumentSearchState>
   >({});
   const [referenceChunkSelector, setReferenceChunkSelector] =
-    useState<ReferenceChunkSelectorState>({
-      open: false,
-      loading: false,
-      confirming: false,
-      error: "",
-      itemId: "",
-      documentName: "",
-      documentPreviewUrl: "",
-      segmentGroup: "",
-      chunks: [],
-      selectedChunkIds: [],
-    });
+    useState<ReferenceChunkSelectorState>(createReferenceChunkSelectorState);
   const documentSearchPaginationRequestRef = useRef<Record<string, string>>({});
+  const documentSearchRequestRef = useRef<Record<string, number>>({});
+  const referenceChunkSelectorRequestRef = useRef(0);
   const referenceDocumentCacheRef = useRef<Record<string, ReferenceDocumentPreview>>({});
   const [referenceDocumentCacheVersion, setReferenceDocumentCacheVersion] = useState(0);
   const referenceContextInsertIndexRef = useRef<Record<string, number | undefined>>({});
   const referenceContextEditingValueRef = useRef<Record<string, string | undefined>>({});
   const referenceContextEditingDirtyRef = useRef<Record<string, boolean | undefined>>({});
+  const pendingNewItemCellActivationRef = useRef<ActiveEditableCell>(null);
+  const requiredItemMessages = useMemo(
+    () => ({
+      question: t("datasetManagement.validation.questionRequired"),
+      question_type: t("datasetManagement.validation.questionTypeRequired"),
+      ground_truth: t("datasetManagement.validation.groundTruthRequired"),
+    }),
+    [t],
+  );
 
   const resetReferenceChunkSelector = useCallback(() => {
-    setReferenceChunkSelector({
-      open: false,
-      loading: false,
-      confirming: false,
-      error: "",
-      itemId: "",
-      documentName: "",
-      documentPreviewUrl: "",
-      segmentGroup: "",
-      chunks: [],
-      selectedChunkIds: [],
+    referenceChunkSelectorRequestRef.current += 1;
+    setReferenceChunkSelector(createReferenceChunkSelectorState());
+  }, []);
+
+  const clearReferenceContextRuntimeState = useCallback((itemId: string) => {
+    delete referenceContextInsertIndexRef.current[itemId];
+    delete referenceContextEditingValueRef.current[itemId];
+    delete referenceContextEditingDirtyRef.current[itemId];
+  }, []);
+
+  const clearReferenceDocumentRuntimeState = useCallback((itemId: string) => {
+    delete documentSearchPaginationRequestRef.current[itemId];
+    delete documentSearchRequestRef.current[itemId];
+    setDocumentSearchState((current) => {
+      if (!current[itemId]) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[itemId];
+      return next;
     });
+  }, []);
+
+  const clearItemRuntimeState = useCallback(
+    (itemId: string) => {
+      clearReferenceContextRuntimeState(itemId);
+      if (itemId === NEW_ITEM_ID) {
+        pendingNewItemCellActivationRef.current = null;
+      }
+      clearReferenceDocumentRuntimeState(itemId);
+    },
+    [clearReferenceContextRuntimeState, clearReferenceDocumentRuntimeState],
+  );
+
+  const clearAllItemRuntimeState = useCallback(() => {
+    documentSearchPaginationRequestRef.current = {};
+    documentSearchRequestRef.current = {};
+    referenceContextInsertIndexRef.current = {};
+    referenceContextEditingValueRef.current = {};
+    referenceContextEditingDirtyRef.current = {};
+    pendingNewItemCellActivationRef.current = null;
+    referenceChunkSelectorRequestRef.current += 1;
+    setDocumentSearchState({});
+    setReferenceChunkSelector(createReferenceChunkSelectorState());
   }, []);
 
   const handleColumnResize = useCallback(
@@ -935,6 +1058,16 @@ export default function DatasetDetailPage() {
     [columnWidths, handleColumnResize, handleHeaderResize, headerHeight],
   );
 
+  useEffect(() => {
+    clearAllItemRuntimeState();
+    referenceDocumentCacheRef.current = {};
+    setReferenceDocumentCacheVersion((version) => version + 1);
+    setSelectedRowKeys([]);
+    setDirtyItemIds([]);
+    setNewItemVisible(false);
+    setActiveCell(null);
+  }, [clearAllItemRuntimeState, datasetId]);
+
   const loadDetail = async () => {
     if (!datasetId) {
       return;
@@ -950,16 +1083,14 @@ export default function DatasetDetailPage() {
           page: pagination.current,
           pageSize: pagination.pageSize,
         }),
-        listQuestionTypes().catch(() => []),
+        listDatasetQuestionTypes(datasetId).catch(() => []),
       ]);
       setDataset(datasetDetail);
       setItems(itemList.items);
       setTotal(itemList.total);
-      if (remoteQuestionTypes.length > 0) {
-        setQuestionTypeOptions(remoteQuestionTypes);
-      }
+      setQuestionTypeOptions(remoteQuestionTypes);
     } catch (error: any) {
-      message.error(error?.message || "数据集加载失败");
+      message.error(error?.message || t("datasetManagement.detail.loadFailed"));
     } finally {
       setLoading(false);
     }
@@ -988,11 +1119,11 @@ export default function DatasetDetailPage() {
   useEffect(() => {
     if (
       activeCell &&
-      !visibleColumnKeys.includes(editableFieldColumnMap[activeCell.field])
+      !effectiveVisibleColumnKeys.includes(editableFieldColumnMap[activeCell.field])
     ) {
       setActiveCell(null);
     }
-  }, [activeCell, visibleColumnKeys]);
+  }, [activeCell, effectiveVisibleColumnKeys]);
 
   const confirmDiscardDirty = () =>
     new Promise<boolean>((resolve) => {
@@ -1001,10 +1132,10 @@ export default function DatasetDetailPage() {
         return;
       }
       Modal.confirm({
-        title: "存在未保存的编辑",
-        content: "切换后当前编辑内容将丢失，是否继续？",
-        okText: "继续",
-        cancelText: "取消",
+        title: t("datasetManagement.detail.unsavedTitle"),
+        content: t("datasetManagement.detail.unsavedContent"),
+        okText: t("datasetManagement.detail.continue"),
+        cancelText: t("common.cancel"),
         onOk: () => resolve(true),
         onCancel: () => resolve(false),
       });
@@ -1015,6 +1146,7 @@ export default function DatasetDetailPage() {
     if (!canContinue) {
       return;
     }
+    clearAllItemRuntimeState();
     setDirtyItemIds([]);
     setNewItemVisible(false);
     setActiveCell(null);
@@ -1027,6 +1159,7 @@ export default function DatasetDetailPage() {
     if (!canContinue) {
       return;
     }
+    clearAllItemRuntimeState();
     setNewItemVisible(true);
     setDirtyItemIds([NEW_ITEM_ID]);
     setDrafts({ [NEW_ITEM_ID]: createItemDraft() });
@@ -1070,15 +1203,26 @@ export default function DatasetDetailPage() {
   };
 
   const handleReferenceDocumentSearch = async (record: DatasetItem, value: string) => {
-    setDrafts((current) => ({
-      ...current,
-      [record.id]: {
-        ...(current[record.id] || createItemDraft(record.id === NEW_ITEM_ID ? undefined : record)),
-        reference_doc: value || "",
-        reference_doc_ids: "",
-        reference_chunk_ids: "",
-      },
-    }));
+    const searchRequestId = (documentSearchRequestRef.current[record.id] || 0) + 1;
+    documentSearchRequestRef.current[record.id] = searchRequestId;
+    setDrafts((current) => {
+      const currentDraft =
+        current[record.id] || createItemDraft(record.id === NEW_ITEM_ID ? undefined : record);
+      const referenceContext =
+        referenceContextEditingValueRef.current[record.id] ??
+        currentDraft.reference_context ??
+        "";
+      return {
+        ...current,
+        [record.id]: {
+          ...currentDraft,
+          reference_doc: value || "",
+          reference_doc_ids: "",
+          reference_chunk_ids: referenceContextChunkIDs(referenceContext).join(", "),
+          reference_context: referenceContext,
+        },
+      };
+    });
     setDirtyItemIds((current) =>
       current.includes(record.id) ? current : [...current, record.id],
     );
@@ -1109,6 +1253,9 @@ export default function DatasetDetailPage() {
     try {
       const result = await searchKnowledgeBaseDocuments(knowledgeBaseIds, keyword);
       setDocumentSearchState((current) => {
+        if (documentSearchRequestRef.current[record.id] !== searchRequestId) {
+          return current;
+        }
         const latestKeyword = current[record.id]?.keyword || "";
         if (latestKeyword !== keyword) {
           return current;
@@ -1125,6 +1272,9 @@ export default function DatasetDetailPage() {
         };
       });
     } catch {
+      if (documentSearchRequestRef.current[record.id] !== searchRequestId) {
+        return;
+      }
       updateDocumentSearchState(record.id, {
         keyword,
         loading: false,
@@ -1209,6 +1359,8 @@ export default function DatasetDetailPage() {
     record: DatasetItem,
     option: KnowledgeDocumentOption,
   ) => {
+    documentSearchRequestRef.current[record.id] =
+      (documentSearchRequestRef.current[record.id] || 0) + 1;
     if (option.datasetId) {
       referenceDocumentCacheRef.current[option.documentId] = {
         datasetId: option.datasetId,
@@ -1217,15 +1369,24 @@ export default function DatasetDetailPage() {
       };
       setReferenceDocumentCacheVersion((version) => version + 1);
     }
-    setDrafts((current) => ({
-      ...current,
-      [record.id]: {
-        ...(current[record.id] || createItemDraft(record.id === NEW_ITEM_ID ? undefined : record)),
-        reference_doc: option.name,
-        reference_doc_ids: option.documentId,
-        reference_chunk_ids: "",
-      },
-    }));
+    setDrafts((current) => {
+      const currentDraft =
+        current[record.id] || createItemDraft(record.id === NEW_ITEM_ID ? undefined : record);
+      const referenceContext =
+        referenceContextEditingValueRef.current[record.id] ??
+        currentDraft.reference_context ??
+        "";
+      return {
+        ...current,
+        [record.id]: {
+          ...currentDraft,
+          reference_doc: option.name,
+          reference_doc_ids: option.documentId,
+          reference_chunk_ids: referenceContextChunkIDs(referenceContext).join(", "),
+          reference_context: referenceContext,
+        },
+      };
+    });
     setDirtyItemIds((current) =>
       current.includes(record.id) ? current : [...current, record.id],
     );
@@ -1241,7 +1402,7 @@ export default function DatasetDetailPage() {
     async (documentId: string, fallbackName: string) => {
       const normalizedDocumentId = `${documentId || ""}`.trim();
       if (!normalizedDocumentId) {
-        throw new Error("请先选择知识库文档");
+        throw new Error(t("datasetManagement.detail.reference.chooseDocumentFirst"));
       }
 
       const cachedDocument = referenceDocumentCacheRef.current[normalizedDocumentId];
@@ -1266,7 +1427,7 @@ export default function DatasetDetailPage() {
         .map((item) => `${item.id || ""}`.trim())
         .filter(Boolean);
       if (knowledgeBaseIds.length === 0) {
-        throw new Error("未找到文档所属知识库，请重新从下拉中选择参考文档");
+        throw new Error(t("datasetManagement.detail.reference.documentKbMissing"));
       }
 
       const matchedDocument = await findKnowledgeBaseDocumentById(
@@ -1274,7 +1435,7 @@ export default function DatasetDetailPage() {
         normalizedDocumentId,
       );
       if (!matchedDocument?.datasetId) {
-        throw new Error("未找到文档所属知识库，请重新从下拉中选择参考文档");
+        throw new Error(t("datasetManagement.detail.reference.documentKbMissing"));
       }
       const resolvedDocument = {
         datasetId: matchedDocument.datasetId,
@@ -1297,7 +1458,7 @@ export default function DatasetDetailPage() {
         ),
       } satisfies ReferenceDocumentPreview;
     },
-    [dataset?.knowledge_bases],
+    [dataset?.knowledge_bases, t],
   );
 
   const handleOpenReferenceChunkSelector = useCallback(
@@ -1308,10 +1469,12 @@ export default function DatasetDetailPage() {
         .map((item) => item.trim())
         .find(Boolean) || "";
       if (!documentId) {
-        message.warning("请先在参考文档中选择平台知识库文档");
+        message.warning(t("datasetManagement.detail.reference.chooseKbDocumentFirst"));
         return;
       }
 
+      const selectorRequestId = referenceChunkSelectorRequestRef.current + 1;
+      referenceChunkSelectorRequestRef.current = selectorRequestId;
       setReferenceChunkSelector({
         open: true,
         loading: true,
@@ -1355,6 +1518,9 @@ export default function DatasetDetailPage() {
           },
         });
         const chunks = segmentResponse.data.segments || [];
+        if (referenceChunkSelectorRequestRef.current !== selectorRequestId) {
+          return;
+        }
         const nextSelectedChunkIds =
           `${draft.reference_chunk_ids || ""}`
             .split(",")
@@ -1373,17 +1539,20 @@ export default function DatasetDetailPage() {
           chunks,
           selectedChunkIds: nextSelectedChunkIds,
           previewSegment,
-          error: chunks.length === 0 ? "该文档暂无可选 chunk" : "",
+          error: chunks.length === 0 ? t("datasetManagement.detail.reference.noChunks") : "",
         }));
       } catch (error: any) {
+        if (referenceChunkSelectorRequestRef.current !== selectorRequestId) {
+          return;
+        }
         setReferenceChunkSelector((current) => ({
           ...current,
           loading: false,
-          error: error?.message || "知识库文档加载失败",
+          error: error?.message || t("datasetManagement.detail.reference.docLoadFailed"),
         }));
       }
     },
-    [drafts, resolveReferenceDocument],
+    [drafts, resolveReferenceDocument, t],
   );
 
   const canSelectReferenceChunks = useCallback(
@@ -1448,7 +1617,7 @@ export default function DatasetDetailPage() {
       referenceChunkSelector.selectedChunkIds.includes(`${chunk.segment_id || ""}`.trim()),
     );
     if (selectedChunks.length === 0) {
-      message.warning("请至少勾选一个 chunk");
+      message.warning(t("datasetManagement.detail.reference.selectAtLeastOneChunk"));
       return;
     }
 
@@ -1479,6 +1648,7 @@ export default function DatasetDetailPage() {
         insertIndex,
       );
       referenceContextEditingValueRef.current[itemId] = nextReferenceContext;
+      referenceContextEditingDirtyRef.current[itemId] = true;
       return {
         ...current,
         [itemId]: {
@@ -1491,9 +1661,10 @@ export default function DatasetDetailPage() {
     setDirtyItemIds((current) => (current.includes(itemId) ? current : [...current, itemId]));
 
     resetReferenceChunkSelector();
-  }, [referenceChunkSelector, resetReferenceChunkSelector]);
+  }, [items, referenceChunkSelector, resetReferenceChunkSelector, t]);
 
   const handleCancelItem = (item: DatasetItem) => {
+    clearItemRuntimeState(item.id);
     if (item.id === NEW_ITEM_ID) {
       setNewItemVisible(false);
       setActiveCell(null);
@@ -1515,7 +1686,7 @@ export default function DatasetDetailPage() {
   };
 
   const handleSaveItem = async (itemId: string, values: DatasetItemFormValues) => {
-    const validationErrors = validateRequiredDatasetItem(values);
+    const validationErrors = validateRequiredDatasetItem(values, requiredItemMessages);
     if (validationErrors.length > 0) {
       message.warning(validationErrors[0]);
       return;
@@ -1524,7 +1695,7 @@ export default function DatasetDetailPage() {
     try {
       if (itemId === NEW_ITEM_ID) {
         await createDatasetItem(datasetId, values);
-        message.success("样本已新增");
+        message.success(t("datasetManagement.detail.sampleAdded"));
         setNewItemVisible(false);
         setActiveCell(null);
       } else {
@@ -1534,21 +1705,31 @@ export default function DatasetDetailPage() {
           itemId,
           currentItem ? mergeHiddenItemFields(currentItem, values) : values,
         );
-        message.success("样本已保存");
+        message.success(t("datasetManagement.detail.sampleSaved"));
       }
       if (activeCell?.itemId === itemId) {
         setActiveCell(null);
       }
+      clearItemRuntimeState(itemId);
       setDirtyItemIds((current) => current.filter((id) => id !== itemId));
       await loadDetail();
     } catch (error: any) {
-      message.error(error?.message || "保存失败");
+      message.error(error?.message || t("datasetManagement.detail.saveFailed"));
     } finally {
       setSaving(false);
     }
   };
 
   const handleAutoSaveItem = async (item: DatasetItem) => {
+    const pendingNewItemCellActivation = pendingNewItemCellActivationRef.current;
+    if (
+      item.id === NEW_ITEM_ID &&
+      pendingNewItemCellActivation?.itemId === NEW_ITEM_ID
+    ) {
+      pendingNewItemCellActivationRef.current = null;
+      return;
+    }
+
     const editingReferenceContext = referenceContextEditingValueRef.current[item.id];
     const referenceContextEditingDirty = Boolean(referenceContextEditingDirtyRef.current[item.id]);
     const baseDraft = drafts[item.id] || createItemDraft(item);
@@ -1568,14 +1749,10 @@ export default function DatasetDetailPage() {
       setActiveCell(null);
       return;
     }
-    if (item.id === NEW_ITEM_ID && validateRequiredDatasetItem(draft).length > 0) {
+    if (item.id === NEW_ITEM_ID && validateRequiredDatasetItem(draft, requiredItemMessages).length > 0) {
       setActiveCell(null);
       return;
     }
-    if (editingReferenceContext !== undefined) {
-      delete referenceContextEditingValueRef.current[item.id];
-    }
-    delete referenceContextEditingDirtyRef.current[item.id];
     await handleSaveItem(item.id, draft);
   };
 
@@ -1585,14 +1762,15 @@ export default function DatasetDetailPage() {
       return;
     }
     Modal.confirm({
-      title: "确认删除该样本？",
+      title: t("datasetManagement.detail.deleteSampleTitle"),
       content: item.question,
-      okText: "删除",
+      okText: t("common.delete"),
       okButtonProps: { danger: true },
-      cancelText: "取消",
+      cancelText: t("common.cancel"),
       onOk: async () => {
         await deleteDatasetItem(datasetId, item.id);
-        message.success("样本已删除");
+        clearItemRuntimeState(item.id);
+        message.success(t("datasetManagement.detail.sampleDeleted"));
         await loadDetail();
       },
     });
@@ -1600,19 +1778,20 @@ export default function DatasetDetailPage() {
 
   const handleBatchDelete = () => {
     if (selectedRowKeys.length === 0) {
-      message.warning("请先选择样本");
+      message.warning(t("datasetManagement.detail.selectSampleFirst"));
       return;
     }
     Modal.confirm({
-      title: `确认删除 ${selectedRowKeys.length} 条样本？`,
-      content: "删除后将从当前表格中移除这些样本。",
-      okText: "删除",
+      title: t("datasetManagement.detail.batchDeleteTitle", { count: selectedRowKeys.length }),
+      content: t("datasetManagement.detail.batchDeleteContent"),
+      okText: t("common.delete"),
       okButtonProps: { danger: true },
-      cancelText: "取消",
+      cancelText: t("common.cancel"),
       onOk: async () => {
         await batchDeleteDatasetItems(datasetId, selectedRowKeys.map(String));
+        selectedRowKeys.map(String).forEach(clearItemRuntimeState);
         setSelectedRowKeys([]);
-        message.success("样本已批量删除");
+        message.success(t("datasetManagement.detail.batchDeleted"));
         await loadDetail();
       },
     });
@@ -1624,7 +1803,9 @@ export default function DatasetDetailPage() {
     file: File | null,
   ) => {
     await importDatasetItems(datasetId, file, importedItems, result.failedCount);
-    message.success("导入完成");
+    clearAllItemRuntimeState();
+    setVisibleColumnKeys(DEFAULT_VISIBLE_COLUMN_KEYS);
+    message.success(t("datasetManagement.detail.importCompleted"));
     await loadDetail();
   };
 
@@ -1636,23 +1817,29 @@ export default function DatasetDetailPage() {
       id: NEW_ITEM_ID,
       dataset_id: datasetId,
       case_id: "",
-      question: "新建样本",
+      question: t("datasetManagement.detail.newSample"),
       question_type: "",
       ground_truth: "",
       source: "manual",
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-      created_by: "当前用户",
+      created_by: t("datasetManagement.detail.currentUser"),
     };
     return [newItem, ...items];
-  }, [datasetId, items, newItemVisible]);
+  }, [datasetId, items, newItemVisible, t]);
 
   const renderCellDisplay = (
     record: DatasetItem,
     field: EditableDatasetItemField,
     placeholder: string,
   ) => {
-    const value = drafts[record.id]?.[field] || "";
+    const draft = drafts[record.id];
+    const value =
+      field === "reference_context"
+        ? referenceContextEditingValueRef.current[record.id] ??
+          draft?.reference_context ??
+          ""
+        : draft?.[field] || "";
     const shouldShowReferenceChunkSelector =
       field === "reference_context" && canSelectReferenceChunks(record);
     return (
@@ -1660,10 +1847,29 @@ export default function DatasetDetailPage() {
         <button
           type="button"
           className={`dataset-inline-display${field === "reference_context" ? " dataset-reference-context-display" : ""}`}
-          onClick={() => setActiveCell({ itemId: record.id, field })}
+          onMouseDown={() => {
+            if (record.id === NEW_ITEM_ID) {
+              pendingNewItemCellActivationRef.current = {
+                itemId: record.id,
+                field,
+              };
+            }
+          }}
+          onClick={() => {
+            setActiveCell({ itemId: record.id, field });
+            if (record.id === NEW_ITEM_ID) {
+              window.setTimeout(() => {
+                pendingNewItemCellActivationRef.current = null;
+              }, 0);
+            }
+          }}
         >
           {field === "reference_context"
-            ? renderReferenceContextParts(value, placeholder)
+            ? renderReferenceContextParts(
+              value,
+              placeholder,
+              (index) => t("datasetManagement.detail.reference.chunkLabel", { index }),
+            )
             : field === "reference_doc"
               ? renderReferenceDocumentTag(value, placeholder)
             : value || <span className="dataset-inline-placeholder">{placeholder}</span>}
@@ -1675,7 +1881,9 @@ export default function DatasetDetailPage() {
             className="dataset-reference-chunk-trigger"
             onClick={() => void handleOpenReferenceChunkSelector(record)}
           >
-            {hasSelectedReferenceChunks(record) ? "已选 chunk" : "选择 chunk"}
+            {hasSelectedReferenceChunks(record)
+              ? t("datasetManagement.detail.reference.selectedChunks")
+              : t("datasetManagement.detail.reference.selectChunks")}
           </Button>
         ) : null}
       </div>
@@ -1704,7 +1912,11 @@ export default function DatasetDetailPage() {
 
   const renderReferenceDocumentInput = (record: DatasetItem) => {
     if (activeCell?.itemId !== record.id || activeCell.field !== "reference_doc") {
-      return renderCellDisplay(record, "reference_doc", "请输入参考文档");
+      return renderCellDisplay(
+        record,
+        "reference_doc",
+        t("datasetManagement.detail.placeholders.referenceDoc"),
+      );
     }
 
     const currentDraft = drafts[record.id];
@@ -1714,9 +1926,7 @@ export default function DatasetDetailPage() {
       .map((item) => item.trim())
       .filter(Boolean);
     const shouldRenderReferenceDocTag =
-      Boolean(currentReferenceDoc) &&
-      (selectedReferenceDocIDs.length > 0 ||
-        currentReferenceDoc === `${record.reference_doc || ""}`.trim());
+      Boolean(currentReferenceDoc) && selectedReferenceDocIDs.length > 0;
 
     if (shouldRenderReferenceDocTag) {
       return (
@@ -1726,23 +1936,26 @@ export default function DatasetDetailPage() {
             <button
               type="button"
               className="dataset-reference-doc-tag-remove"
-              aria-label="删除参考文档"
+              aria-label={t("datasetManagement.detail.reference.deleteReferenceDocAria")}
               onClick={() => {
                 setDrafts((current) => {
                   const currentDraft = current[record.id] || createItemDraft(record);
+                  const referenceContext =
+                    referenceContextEditingValueRef.current[record.id] ??
+                    currentDraft.reference_context ??
+                    "";
                   return {
                     ...current,
                     [record.id]: {
                       ...currentDraft,
                       reference_doc: "",
                       reference_doc_ids: "",
-                      reference_chunk_ids: "",
-                      reference_context: "",
+                      reference_chunk_ids: referenceContextChunkIDs(referenceContext).join(", "),
+                      reference_context: referenceContext,
                     },
                   };
                 });
-                delete referenceContextEditingValueRef.current[record.id];
-                delete referenceContextEditingDirtyRef.current[record.id];
+                clearReferenceDocumentRuntimeState(record.id);
                 setDirtyItemIds((current) =>
                   current.includes(record.id) ? current : [...current, record.id],
                 );
@@ -1780,8 +1993,12 @@ export default function DatasetDetailPage() {
         filterOption={false}
         listHeight={280}
         value={drafts[record.id]?.reference_doc || ""}
-        placeholder="请输入参考文档，输入 @ 可搜索知识库文档"
-        notFoundContent={searchState?.loading ? "搜索中..." : "暂无匹配文档"}
+        placeholder={t("datasetManagement.detail.placeholders.referenceDocSearch")}
+        notFoundContent={
+          searchState?.loading
+            ? t("datasetManagement.detail.reference.searching")
+            : t("datasetManagement.detail.reference.noMatchedDocs")
+        }
         options={autoCompleteOptions}
         onPopupScroll={(event) => {
           void handleReferenceDocumentScroll(record, event);
@@ -1828,6 +2045,12 @@ export default function DatasetDetailPage() {
             onInsertIndexChange={(index) => {
               referenceContextInsertIndexRef.current[record.id] = index;
             }}
+            formatChunkLabel={(index) =>
+              t("datasetManagement.detail.reference.chunkLabel", { index })
+            }
+            formatDeleteChunkAria={(index) =>
+              t("datasetManagement.detail.reference.deleteChunkAria", { index })
+            }
             onRemovePart={(index) => {
               const baseReferenceContext =
                 referenceContextEditingValueRef.current[record.id] ??
@@ -1866,7 +2089,9 @@ export default function DatasetDetailPage() {
               }}
               onClick={() => void handleOpenReferenceChunkSelector(record)}
             >
-              {hasSelectedReferenceChunks(record) ? "已选 chunk" : "选择 chunk"}
+              {hasSelectedReferenceChunks(record)
+                ? t("datasetManagement.detail.reference.selectedChunks")
+                : t("datasetManagement.detail.reference.selectChunks")}
             </Button>
           ) : null}
         </div>
@@ -1889,14 +2114,19 @@ export default function DatasetDetailPage() {
 
   const renderQuestionTypeCell = (record: DatasetItem) => {
     if (activeCell?.itemId !== record.id || activeCell.field !== "question_type") {
-      return renderCellDisplay(record, "question_type", "请选择问题类型");
+      return renderCellDisplay(
+        record,
+        "question_type",
+        t("datasetManagement.detail.placeholders.questionType"),
+      );
     }
     return (
       <QuestionTypeSelect
         value={drafts[record.id]?.question_type || undefined}
-        placeholder="问题类型"
+        placeholder={t("datasetManagement.detail.questionTypePlaceholder")}
         onChange={(value) => handleDraftChange(record, "question_type", value)}
         onBlur={() => void handleAutoSaveItem(record)}
+        options={questionTypeOptions}
       />
     );
   };
@@ -1904,15 +2134,16 @@ export default function DatasetDetailPage() {
   const columns = useMemo<ColumnsType<DatasetItem>>(() => {
     const allColumns: ColumnsType<DatasetItem> = [
       {
-        title: "问题",
+        title: renderRequiredColumnTitle(t(datasetItemFieldI18nKeys.question)),
         dataIndex: "question",
         key: "question",
         width: columnWidths.question,
         onHeaderCell: () => getHeaderCellProps("question"),
-        render: (_, record) => renderInlineInput(record, "question", "请输入问题"),
+        render: (_, record) =>
+          renderInlineInput(record, "question", t("datasetManagement.detail.placeholders.question")),
       },
       {
-        title: "问题类型",
+        title: renderRequiredColumnTitle(t(datasetItemFieldI18nKeys.question_type)),
         dataIndex: "question_type",
         key: "question_type",
         width: columnWidths.question_type,
@@ -1920,25 +2151,33 @@ export default function DatasetDetailPage() {
         render: (_, record) => renderQuestionTypeCell(record),
       },
       {
-        title: "标准答案",
+        title: renderRequiredColumnTitle(t(datasetItemFieldI18nKeys.ground_truth)),
         dataIndex: "ground_truth",
         key: "ground_truth",
         width: columnWidths.ground_truth,
         onHeaderCell: () => getHeaderCellProps("ground_truth"),
         render: (_, record) =>
-          renderInlineTextArea(record, "ground_truth", "请输入标准答案"),
+          renderInlineTextArea(
+            record,
+            "ground_truth",
+            t("datasetManagement.detail.placeholders.groundTruth"),
+          ),
       },
       {
-        title: "答案要点",
+        title: t(datasetItemFieldI18nKeys.key_points),
         dataIndex: "key_points",
         key: "key_points",
         width: columnWidths.key_points,
         onHeaderCell: () => getHeaderCellProps("key_points"),
         render: (_, record) =>
-          renderInlineTextArea(record, "key_points", "请输入答案要点"),
+          renderInlineTextArea(
+            record,
+            "key_points",
+            t("datasetManagement.detail.placeholders.keyPoints"),
+          ),
       },
       {
-        title: "参考文档",
+        title: t(datasetItemFieldI18nKeys.reference_doc),
         dataIndex: "reference_doc",
         key: "reference_doc",
         width: columnWidths.reference_doc,
@@ -1946,25 +2185,20 @@ export default function DatasetDetailPage() {
         render: (_, record) => renderReferenceDocumentInput(record),
       },
       {
-        title: "参考上下文",
+        title: t(datasetItemFieldI18nKeys.reference_context),
         dataIndex: "reference_context",
         key: "reference_context",
         width: columnWidths.reference_context,
         onHeaderCell: () => getHeaderCellProps("reference_context"),
         render: (_, record) =>
-          renderInlineTextArea(record, "reference_context", "请输入参考上下文"),
+          renderInlineTextArea(
+            record,
+            "reference_context",
+            t("datasetManagement.detail.placeholders.referenceContext"),
+          ),
       },
       {
-        title: "生成依据",
-        dataIndex: "generate_reason",
-        key: "generate_reason",
-        width: columnWidths.generate_reason,
-        onHeaderCell: () => getHeaderCellProps("generate_reason"),
-        render: (_, record) =>
-          renderInlineTextArea(record, "generate_reason", "请输入生成依据"),
-      },
-      {
-        title: "来源",
+        title: t("datasetManagement.fields.source"),
         dataIndex: "source",
         key: "source",
         width: columnWidths.source,
@@ -1972,7 +2206,7 @@ export default function DatasetDetailPage() {
         render: (value: DatasetItemSource) => <SourceTypeTag source={value} />,
       },
       {
-        title: "更新时间",
+        title: t("datasetManagement.fields.updatedAt"),
         dataIndex: "updated_at",
         key: "updated_at",
         width: columnWidths.updated_at,
@@ -1980,7 +2214,7 @@ export default function DatasetDetailPage() {
         render: (value) => formatDateTime(value),
       },
       {
-        title: "操作",
+        title: t("common.actions"),
         key: "actions",
         width: columnWidths.actions,
         fixed: "right",
@@ -1990,9 +2224,17 @@ export default function DatasetDetailPage() {
             danger
             size="small"
             icon={<DeleteOutlined />}
+            onMouseDown={() => {
+              if (record.id === NEW_ITEM_ID) {
+                pendingNewItemCellActivationRef.current = {
+                  itemId: NEW_ITEM_ID,
+                  field: activeCell?.field || "question",
+                };
+              }
+            }}
             onClick={() => handleDeleteItem(record)}
           >
-            删除
+            {t("common.delete")}
           </Button>
         ),
       },
@@ -2002,7 +2244,7 @@ export default function DatasetDetailPage() {
       if (column.key === "actions") {
         return true;
       }
-      return visibleColumnKeys.includes(column.key as ConfigurableColumnKey);
+      return effectiveVisibleColumnKeys.includes(column.key as ConfigurableColumnKey);
     });
   }, [
     columnWidths,
@@ -2012,16 +2254,17 @@ export default function DatasetDetailPage() {
     documentSearchState,
     getHeaderCellProps,
     saving,
-    visibleColumnKeys,
+    effectiveVisibleColumnKeys,
+    t,
   ]);
 
   const tableScrollX = useMemo(
     () =>
-      visibleColumnKeys.reduce(
+      effectiveVisibleColumnKeys.reduce(
         (total, columnKey) => total + columnWidths[columnKey],
         columnWidths.actions + 96,
       ),
-    [columnWidths, visibleColumnKeys],
+    [columnWidths, effectiveVisibleColumnKeys],
   );
   const tableStyle = {
     "--dataset-table-header-height": `${headerHeight}px`,
@@ -2030,20 +2273,22 @@ export default function DatasetDetailPage() {
   const columnSettingsContent = (
     <div className="dataset-column-settings">
       <div className="dataset-column-settings-header">
-        <span>选择展示列</span>
+        <span>{t("datasetManagement.columnSettings.selectColumns")}</span>
         <Button
           type="link"
           size="small"
           onClick={() => setVisibleColumnKeys(DEFAULT_VISIBLE_COLUMN_KEYS)}
         >
-          恢复默认
+          {t("datasetManagement.columnSettings.restoreDefault")}
         </Button>
       </div>
       <Checkbox.Group
         className="dataset-column-settings-options"
-        value={visibleColumnKeys}
-        options={CONFIGURABLE_COLUMN_OPTIONS}
-        onChange={(values) => setVisibleColumnKeys(values as ConfigurableColumnKey[])}
+        value={effectiveVisibleColumnKeys}
+        options={columnSettingOptions}
+        onChange={(values) =>
+          setVisibleColumnKeys(normalizeVisibleColumnKeys(values as ConfigurableColumnKey[]))
+        }
       />
     </div>
   );
@@ -2061,7 +2306,9 @@ export default function DatasetDetailPage() {
             }
           }}
         >
-          数据集管理 / {dataset?.name || "数据集详情"}
+          {t("datasetManagement.detail.breadcrumb", {
+            name: dataset?.name || t("datasetManagement.detail.titleFallback"),
+          })}
         </Button>
       </div>
 
@@ -2069,20 +2316,20 @@ export default function DatasetDetailPage() {
         <div className="dataset-detail-actions">
           <Space wrap>
             <Button type="primary" icon={<PlusOutlined />} onClick={handleAddItem}>
-              新增样本
+              {t("datasetManagement.detail.addSample")}
             </Button>
             <Button icon={<ImportOutlined />} onClick={() => setImportModalOpen(true)}>
-              导入数据
+              {t("datasetManagement.detail.importData")}
             </Button>
             <Button danger icon={<DeleteOutlined />} onClick={handleBatchDelete}>
-              批量删除
+              {t("datasetManagement.detail.batchDelete")}
             </Button>
             <Popover
               trigger="click"
               placement="bottomRight"
               content={columnSettingsContent}
             >
-              <Button icon={<SettingOutlined />}>列设置</Button>
+              <Button icon={<SettingOutlined />}>{t("datasetManagement.detail.columnSettings")}</Button>
             </Popover>
           </Space>
         </div>
@@ -2092,7 +2339,7 @@ export default function DatasetDetailPage() {
             allowClear
             className="dataset-detail-search"
             prefix={<SearchOutlined />}
-            placeholder="搜索问题/答案"
+            placeholder={t("datasetManagement.detail.searchPlaceholder")}
             value={keyword}
             onChange={(event) => setKeyword(event.target.value)}
             onPressEnter={handleFilterSearch}
@@ -2102,22 +2349,22 @@ export default function DatasetDetailPage() {
               allowClear
               value={questionType}
               onChange={setQuestionType}
-              placeholder="问题类型"
+              placeholder={t("datasetManagement.detail.questionTypePlaceholder")}
               options={questionTypeOptions}
             />
             <Select
               allowClear
               className="dataset-source-filter"
               value={source}
-              placeholder="来源"
+              placeholder={t("datasetManagement.detail.sourcePlaceholder")}
               onChange={setSource}
               options={(["upload", "manual", "flowback"] as const).map((value) => ({
-                label: sourceLabelMap[value],
+                label: t(sourceLabelI18nKeys[value]),
                 value,
               }))}
             />
             <Button type="primary" onClick={handleFilterSearch}>
-              查询
+              {t("datasetManagement.detail.search")}
             </Button>
           </div>
         </div>
@@ -2134,7 +2381,7 @@ export default function DatasetDetailPage() {
             emptyText: (
               <Empty
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description="暂无样本数据"
+                description={t("datasetManagement.detail.emptySamples")}
               />
             ),
           }}
@@ -2155,12 +2402,14 @@ export default function DatasetDetailPage() {
             current: pagination.current,
             pageSize: pagination.pageSize,
             total,
-            showTotal: (currentTotal) => `共 ${currentTotal} 条`,
+            showTotal: (currentTotal) =>
+              t("datasetManagement.detail.paginationTotal", { total: currentTotal }),
             onChange: async (current, pageSize) => {
               const canContinue = await confirmDiscardDirty();
               if (!canContinue) {
                 return;
               }
+              clearAllItemRuntimeState();
               setDirtyItemIds([]);
               setNewItemVisible(false);
               setActiveCell(null);
@@ -2178,10 +2427,16 @@ export default function DatasetDetailPage() {
 
       <Modal
         open={referenceChunkSelector.open}
-        title={`选择参考上下文${referenceChunkSelector.documentName ? ` - ${referenceChunkSelector.documentName}` : ""}`}
+        title={
+          referenceChunkSelector.documentName
+            ? t("datasetManagement.detail.reference.selectorTitleWithName", {
+              name: referenceChunkSelector.documentName,
+            })
+            : t("datasetManagement.detail.reference.selectorTitle")
+        }
         width={1200}
-        okText="确定"
-        cancelText="取消"
+        okText={t("common.confirm")}
+        cancelText={t("common.cancel")}
         confirmLoading={referenceChunkSelector.confirming}
         onOk={() => void handleConfirmReferenceChunks()}
         onCancel={resetReferenceChunkSelector}
@@ -2189,10 +2444,14 @@ export default function DatasetDetailPage() {
       >
         <div className="dataset-reference-modal">
           <div className="dataset-reference-modal-panel">
-            <div className="dataset-reference-modal-panel-header">文档原文</div>
+            <div className="dataset-reference-modal-panel-header">
+              {t("datasetManagement.detail.reference.originalDocument")}
+            </div>
             <div className="dataset-reference-modal-panel-body dataset-reference-modal-preview">
               {referenceChunkSelector.loading ? (
-                <div className="dataset-reference-modal-empty">加载中...</div>
+                <div className="dataset-reference-modal-empty">
+                  {t("datasetManagement.detail.reference.loading")}
+                </div>
               ) : referenceChunkSelector.documentPreviewUrl ? (
                 <FileViewer
                   file={referenceChunkSelector.documentPreviewUrl}
@@ -2200,21 +2459,29 @@ export default function DatasetDetailPage() {
                   segment={referenceChunkSelector.previewSegment}
                 />
               ) : (
-                <div className="dataset-reference-modal-empty">当前文档暂不支持原文预览</div>
+                <div className="dataset-reference-modal-empty">
+                  {t("datasetManagement.detail.reference.previewUnsupported")}
+                </div>
               )}
             </div>
           </div>
           <div className="dataset-reference-modal-panel">
             <div className="dataset-reference-modal-panel-header">
-              已解析 chunk（已选 {referenceChunkSelector.selectedChunkIds.length}）
+              {t("datasetManagement.detail.reference.parsedChunksTitle", {
+                count: referenceChunkSelector.selectedChunkIds.length,
+              })}
             </div>
             <div className="dataset-reference-modal-panel-body">
               {referenceChunkSelector.error ? (
                 <div className="dataset-reference-modal-empty">{referenceChunkSelector.error}</div>
               ) : referenceChunkSelector.loading ? (
-                <div className="dataset-reference-modal-empty">加载中...</div>
+                <div className="dataset-reference-modal-empty">
+                  {t("datasetManagement.detail.reference.loading")}
+                </div>
               ) : referenceChunkSelector.chunks.length === 0 ? (
-                <div className="dataset-reference-modal-empty">暂无可选 chunk</div>
+                <div className="dataset-reference-modal-empty">
+                  {t("datasetManagement.detail.reference.noChunks")}
+                </div>
               ) : (
                 <div className="dataset-reference-chunk-list">
                   {referenceChunkSelector.chunks.map((chunk, index) => {
@@ -2240,11 +2507,13 @@ export default function DatasetDetailPage() {
                         />
                         <div className="dataset-reference-chunk-content">
                           <div className="dataset-reference-chunk-title">
-                            Chunk {index + 1}
+                            {t("datasetManagement.detail.reference.chunkTitle", {
+                              index: index + 1,
+                            })}
                             {segmentId ? ` · ${segmentId}` : ""}
                           </div>
                           <div className="dataset-reference-chunk-text">
-                            {content || "该 chunk 暂无文本内容"}
+                            {content || t("datasetManagement.detail.reference.emptyChunkText")}
                           </div>
                         </div>
                       </label>
