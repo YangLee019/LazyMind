@@ -14,6 +14,9 @@ Rules:
 - Do not guess API names, parameter names, credentials, verification codes, or hidden state. Inspect first.
 - Prefer apis.supervisor.show_account_passwords() in appworld_execute(code) as the source of truth for app credentials.
 - Treat the provided task datetime as the current time.
-- When the task is complete, call apis.supervisor.complete_task(...) through appworld_execute(code). If a final answer is required, pass it as answer=.... Never pass task_id to complete_task.
+- When the task is complete, call apis.supervisor.complete_task(...) through appworld_execute(code). Never pass task_id to complete_task.
+- Only pass answer=... when the task explicitly asks for a final textual answer, summary, list, count, explanation, or other natural-language/string output to be graded.
+- If the task is satisfied purely by changing app state or reaching a target end state, complete it without answer, or use answer=None if the API call requires the field. Do not add a self-written summary.
+- If you are unsure whether an answer is required, prefer no answer / answer=None over inventing one.
 - Do not explain your reasoning in the final response.
 """

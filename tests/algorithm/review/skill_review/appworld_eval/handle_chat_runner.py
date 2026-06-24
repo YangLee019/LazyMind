@@ -725,6 +725,41 @@ def _nested_get(value: dict[str, Any], *keys: str) -> Any:
     return current
 
 
+def _extract_adjusted_success_info(
+    *,
+    success: bool,
+    completed: bool,
+    error: str | None,
+    evaluation: dict[str, Any],
+) -> tuple[bool, str | None]:
+    if success:
+        return True, None
+    if error is not None or not completed or not isinstance(evaluation, dict):
+        return False, None
+
+    failures = evaluation.get('failures')
+    passes = evaluation.get('passes')
+    num_tests_raw = evaluation.get('num_tests')
+    if not isinstance(failures, list) or len(failures) != 1:
+        return False, None
+    failure = failures[0] if isinstance(failures[0], dict) else {}
+    requirement = str(failure.get('requirement') or '').strip().lower()
+    trace = str(failure.get('trace') or '')
+    if requirement != 'assert answers match.':
+        return False, None
+    if "'null'" not in trace and '==\nnull' not in trace.lower():
+        return False, None
+    if not isinstance(passes, list):
+        return False, None
+    try:
+        num_tests = int(num_tests_raw or 0)
+    except (TypeError, ValueError):
+        return False, None
+    if num_tests <= 0 or len(passes) != max(num_tests - 1, 0):
+        return False, None
+    return True, 'answer_should_be_null'
+
+
 def _build_chat_history_row(
     *,
     episode_index: int,
@@ -751,6 +786,8 @@ def _build_chat_history_row(
         'session_id': session_id,
         'session_prefix': session_prefix,
         'success': result.get('success'),
+        'adjusted_success': result.get('adjusted_success'),
+        'adjusted_success_reason': result.get('adjusted_success_reason'),
         'steps': result.get('steps'),
         'tool_call_rounds': result.get('tool_call_rounds'),
         'handle_chat_tool_call_turns': result.get('handle_chat_tool_call_turns'),
@@ -824,10 +861,19 @@ def _task_result(
     evaluation = _extract_evaluation(evaluation_payload, runtime)
     steps = _extract_step_count(task_status, runtime)
     completed = _extract_completed(task_status, runtime)
+    success = error is None and bool(evaluation.get('success') is True)
+    adjusted_success, adjusted_success_reason = _extract_adjusted_success_info(
+        success=success,
+        completed=completed,
+        error=error,
+        evaluation=evaluation,
+    )
     return {
         'episode_index': episode_index,
         'task_id': task_id,
-        'success': error is None and bool(evaluation.get('success') is True),
+        'success': success,
+        'adjusted_success': adjusted_success,
+        'adjusted_success_reason': adjusted_success_reason,
         'steps': steps,
         'tool_call_rounds': steps,
         'handle_chat_tool_call_turns': service_tool_call_turns,
