@@ -33,6 +33,7 @@ def compute_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
 
     total_tests = 0
     total_passes = 0
+    adjusted_total_passes = 0
     completed_count = 0
     for result in results:
         if bool(result.get('completed')):
@@ -41,8 +42,13 @@ def compute_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         if not isinstance(evaluation, dict):
             continue
         num_tests = _num_tests(evaluation)
+        pass_count = _pass_count(evaluation, num_tests)
         total_tests += num_tests
-        total_passes += _pass_count(evaluation, num_tests)
+        total_passes += pass_count
+        if bool(result.get('adjusted_success')):
+            adjusted_total_passes += num_tests
+        else:
+            adjusted_total_passes += pass_count
         reason = str(result.get('adjusted_success_reason') or '').strip()
         if reason:
             adjusted_by_reason[reason] = adjusted_by_reason.get(reason, 0) + 1
@@ -65,5 +71,6 @@ def compute_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         'total_tests': total_tests,
         'total_passes': total_passes,
         'test_pass_rate': total_passes / total_tests if total_tests else None,
+        'adjusted_test_pass_rate': adjusted_total_passes / total_tests if total_tests else None,
         'adjusted_success_breakdown': adjusted_by_reason,
     }

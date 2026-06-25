@@ -191,6 +191,7 @@ python tests/algorithm/review/skill_review/appworld_eval/run_eval.py \
 - `total_tests`
 - `total_passes`
 - `test_pass_rate`
+- `adjusted_test_pass_rate`
 
 单个任务结果示例：
 

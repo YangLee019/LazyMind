@@ -66,65 +66,51 @@ value_type candidates: success_pattern, failure_pattern, reasoning_pattern, retr
 
 
 def cluster_signature_prompt(trajectory: str) -> str:
-def cluster_signature_prompt(trajectory: str) -> str:
     return f"""
 You are an expert Agent Memory Abstraction Engine, your task is to summarize the trajectory into a structured "contextual_description" for future task clustering and skill mining.
 
 Your task is to extract a compact "cluster_signature" for future task clustering and skill mining.
-Your task is to extract a compact "cluster_signature" for future task clustering and skill mining.
 
 # Objective
 
-Extract only the reusable task structure needed to decide whether multiple drafts should become one skill.
 Extract only the reusable task structure needed to decide whether multiple drafts should become one skill.
 
 The output should describe:
 1. The reusable task intent
 2. The high-level reusable procedure
 3. The applicability boundary for the skill
-1. The reusable task intent
-2. The high-level reusable procedure
-3. The applicability boundary for the skill
 
 # Requirements
 
-- Preserve reusable workflow structure, not case-specific details
-- Describe the broad reusable skill family, not the narrow observed case
-- Keep wording general enough for reusable skill mining, but not vague
-- Remove names, ids, dates, locations, prices, exact quantities, and incidental tool errors
-- Do not mention exact tool names unless they define the reusable task
-- Do not include every observed root cause in the intent; prefer a task-family description
-- Do not include fallback options, alternative resolutions, or customer choice variants in the intent unless they define a materially different workflow
-- Merge adjacent diagnostics into broader steps when they belong to the same troubleshooting workflow
-- Use 3-6 procedure steps
-- Boundaries must be one concise paragraph describing the positive applicability scope and only materially different workflows it should not cover
-- Do not exclude nearby variants that the same reusable procedure can handle
-- Do not exclude alternative remediation options, fallback paths, optional checks, or customer preference variants that belong to the same task family
-- Do not exclude cases based on incidental episode outcomes, such as whether a tool succeeded or failed
-- Avoid vague phrases like "help the user" or "solve the issue"
-- Preserve reusable workflow structure, not case-specific details
-- Describe the broad reusable skill family, not the narrow observed case
-- Keep wording general enough for reusable skill mining, but not vague
-- Remove names, ids, dates, locations, prices, exact quantities, and incidental tool errors
-- Do not mention exact tool names unless they define the reusable task
-- Do not include every observed root cause in the intent; prefer a task-family description
-- Do not include fallback options, alternative resolutions, or customer choice variants in the intent unless they define a materially different workflow
-- Merge adjacent diagnostics into broader steps when they belong to the same troubleshooting workflow
-- Use 3-6 procedure steps
-- Boundaries must be one concise paragraph describing the positive applicability scope and only materially different workflows it should not cover
-- Do not exclude nearby variants that the same reusable procedure can handle
-- Do not exclude alternative remediation options, fallback paths, optional checks, or customer preference variants that belong to the same task family
-- Do not exclude cases based on incidental episode outcomes, such as whether a tool succeeded or failed
-- Avoid vague phrases like "help the user" or "solve the issue"
-- output should be in the same language as the trajectory
+- Preserve reusable workflow structure, not case-specific details.
+- Keep wording general enough for reuse, but specific enough to separate this workflow from nearby ones.
+- Remove names, ids, dates, locations, prices, exact quantities, and incidental tool errors.
+- Do not mention exact tool names unless they define the reusable task.
+- output should be in the same language as the trajectory.
+
+For `intent`:
+- Describe exactly one primary task family, centered on one main objective and one main action space.
+- Prefer the stable reusable objective over the narrow observed case, but do not broaden across materially different workflows.
+- Do not mix read-only analysis, state-changing execution, and cross-domain side tasks into one intent.
+- Do not include fallback options, alternative resolutions, customer choice variants, or every observed root cause unless they change the core workflow.
+- Avoid vague phrases like "help the user", "handle the issue", or other generic outcome language.
+
+For `procedure`:
+- Use 3-6 high-level reusable steps.
+- Keep only the core workflow needed to distinguish this skill family.
+- Merge adjacent diagnostics into broader steps when they belong to the same workflow.
+- Do not preserve detours, retries, or auxiliary work that does not define the reusable procedure.
+
+For `boundaries`:
+- Write one concise paragraph covering both when this workflow applies and when it should stay separate.
+- Keep nearby variants together only if the same core procedure and action space still solve them.
+- Separate cases that change the primary action space, target object space, or completion condition.
+- Do not exclude cases only because of incidental outcomes such as a tool success/failure, a specific root cause, or an optional recovery path.
 
 # Output Format
 
 Return ONLY valid JSON:
 {{
-  "intent": "...",
-  "procedure": ["...", "...", "..."],
-  "boundaries": "..."
   "intent": "...",
   "procedure": ["...", "...", "..."],
   "boundaries": "..."
@@ -199,13 +185,11 @@ You are an expert Skill Review Refactoring Engine, your task is to convert an ex
 The pending skill is already structured, so extract only the three core parts needed by the skill mining pipeline:
 
 1. cluster_signature
-1. cluster_signature
 2. refined_trajectory
 3. guidelines
 
 # Requirements
 
-- Use the title and content to identify the reusable intent, procedure, and applicability boundary.
 - Use the title and content to identify the reusable intent, procedure, and applicability boundary.
 - Split the skill content into meaningful operational steps for refined_trajectory.
 - Summarize the guidance embedded in each step into concise guidelines.
@@ -217,10 +201,6 @@ The pending skill is already structured, so extract only the three core parts ne
 
 Return ONLY valid JSON:
 {{
-  "cluster_signature": {{
-    "intent": "...",
-    "procedure": ["...", "...", "..."],
-    "boundaries": "..."
   "cluster_signature": {{
     "intent": "...",
     "procedure": ["...", "...", "..."],
@@ -316,8 +296,6 @@ def draft_prompt(trajectory: dict[str, Any]) -> str:
         'You extract a reusable skill draft from one agent trajectory.\n'
         'Return JSON only with keys: cluster_signature, refined_trajectory, guidelines.\n'
         'cluster_signature has intent, procedure, boundaries.\n'
-        'Return JSON only with keys: cluster_signature, refined_trajectory, guidelines.\n'
-        'cluster_signature has intent, procedure, boundaries.\n'
         'refined_trajectory has steps: step_index, role, action, state, tool_name, skill_name.\n'
         'guidelines has success_patterns and failure_patterns, each item has related_step and guideline.\n\n'
         f'TRAJECTORY:\n{json.dumps(trajectory, ensure_ascii=False, indent=2)}'
@@ -326,20 +304,6 @@ def draft_prompt(trajectory: dict[str, Any]) -> str:
 
 def cluster_prompt(drafts: list[dict[str, Any]]) -> str:
     return (
-        'Cluster skill draft signatures into reusable skill families.\n'
-        'Return JSON only: {"clusters":[{"task_scope":"...","draft_indexes":[0]}]}.\n\n'
-        'Merge drafts when they share the same reusable task intent, high-level procedure, and applicability scope.\n'
-        'Do not split drafts merely because one case has an extra root cause, a different outcome, a tool failure, '
-        'a different language/style, or a narrower boundary statement.\n'
-        'Do not split drafts merely because one includes an extra fallback option, alternative remediation path, '
-        'plan/customer choice variant, or broader/narrower wording.\n'
-        'Keep drafts separate only when an agent would need a materially different procedure or the combined skill '
-        'would become ambiguous.\n'
-        'A singleton cluster is allowed only when no existing cluster can handle that draft without changing the core procedure.\n'
-        'If a draft differs only by an extra fallback option, broader wording, or an alternative customer choice, '
-        'merge it into the closest broader cluster.\n'
-        'Every draft index must appear exactly once. Use the provided draft_index values.\n\n'
-        f'DRAFT_SIGNATURES:\n{json.dumps(drafts, ensure_ascii=False, indent=2)}'
         'Cluster skill draft signatures into reusable skill families.\n'
         'Return JSON only: {"clusters":[{"task_scope":"...","draft_indexes":[0]}]}.\n\n'
         'Merge drafts when they share the same reusable task intent, high-level procedure, and applicability scope.\n'
@@ -397,27 +361,35 @@ skill_name must:
 
 # Mandatory SOP Constraints
 
-Every SOP MUST begin with step_name = "Anchor on Task Goal".
-- action_goal: extract objectives, explicit constraints, and completion criteria so all later work can be checked against them.
-- branch_conditions must include incompatible constraints -> abort and state the conflict.
-- branch_conditions must include task fits SOP -> use extracted criteria as the checklist.
-- expected_state: all objectives, constraints, and completion criteria are explicitly listed and understood.
+Every SOP MUST begin with step_name = "Anchor on Task Goal":
+- action_goal extracts objectives, explicit constraints, and completion criteria.
+- branch_conditions include incompatible constraints -> abort and state the conflict, and task fits SOP -> use extracted criteria as the checklist.
+- expected_state confirms all objectives, constraints, and completion criteria are explicitly understood.
 
-Every SOP can end with step_name = "Verify Completion".
-- action_goal: confirm every criterion from the anchoring step has been satisfied before declaring success or failure.
-- branch_conditions must include all criteria satisfied -> report success with evidence.
-- branch_conditions must include any criterion unmet -> report the unmet criterion and do not claim success.
-- expected_state: every anchoring criterion has been independently checked.
+Every SOP SHOULD end with step_name = "Verify Completion":
+- action_goal checks every anchoring criterion before declaring success or failure.
+- branch_conditions include all criteria satisfied -> report success with evidence, and any criterion unmet -> report the unmet criterion and do not claim success.
+- expected_state confirms every anchoring criterion has been independently checked.
 
 For every SOP step:
-- include at least one meaningful branch_condition.
-- avoid tautologies such as "continue", "try again", or "if successful proceed".
-- expected_state should describe the completed state and, when useful, when the step can be skipped.
+- step_name should be a short procedural stage name.
+- action_goal should explain the step purpose and what progress it enables.
+- include at least one meaningful branch_condition with a real decision, not tautologies like "continue" or "if successful proceed".
+- expected_state should describe the observable completed state and, when useful, when the step can be skipped.
 
-Across the SOP, include all of these gates at least once:
-- goal-completion gate: current state already satisfies the task -> skip remaining work.
-- constraint-boundary gate: this action would violate a known constraint -> take corrective action instead.
-- information-quality gate: available information is insufficient for a decision -> gather more before proceeding.
+Across the SOP, include at least once:
+- goal already satisfied -> skip remaining work
+- action would violate a known constraint -> correct or choose a compliant alternative
+- available information is insufficient -> gather or validate more before deciding
+
+# Scope Capsule
+
+`applicable_scenario` is the single scope field for downstream generation. Write it as one compact capsule that contains:
+- the reusable trigger
+- the prerequisite state or framing that must already hold
+- the nearest exclusions that distinguish this skill from adjacent workflows
+
+Keep it concise, but specific enough that downstream generation can treat `applicable_scenario` as the authoritative scope summary. Do not defer this scope writing to a later stage.
 
 BAD branch_conditions:
 - "Continue to next step."
@@ -450,13 +422,6 @@ Return ONLY valid JSON:
   }}
 }}
 
-# Step Writing Rules
-
-- step_name: short procedural stage name.
-- action_goal: explain why the step exists, what capability it provides, and what progress it enables.
-- branch_conditions: real decision points with different next actions.
-- expected_state: observable state after successful completion, including skip condition when useful.
-
 # Input Data
 
 TASK_SCOPE:
@@ -481,13 +446,16 @@ Your job is to synthesize them into a human-authored `SKILL.md` document. The `c
 
 - Preserve the outline's execution order, stage progression, and branching structure.
 - Enrich each SOP step with deduplicated, integrated operational guidance.
-- Make the skill specific enough that an agent can decide when to use it and when NOT to use it.
+- Reuse the outline's scope boundary as authoritative instead of inventing a new one.
 - Improve reliability, recovery, decision quality, and self-checking.
 - Do not merge different action spaces into one skill, especially read-only workflows with state-changing workflows.
+- Ignore source-specific detours, one-off troubleshooting branches, and incidental trajectory noise unless they are required for the reusable workflow boundary.
 
 # Guideline Integration
 
 Merge related guidelines by meaning, deduplicate them, organize them under relevant SOP steps, and turn them into fluent procedural guidance. Explain intent/tradeoff when useful. Do not copy raw guideline lists or preserve every guideline just because it appears in input.
+
+When guidelines conflict in specificity, keep the guidance that best defines the reusable core workflow. Drop incidental retries, dead ends, one-off environment artifacts, and side goals outside the skill's primary action space.
 
 BAD:
 - "Guidelines: ..., Success patterns: ..., Failure patterns: ..."
@@ -516,32 +484,25 @@ GOOD description:
 - "When you need to validate structured data against a known schema - provides systematic constraint checking (NOT for exploratory data browsing or ad-hoc queries)"
 
 Required Markdown sections in order:
-1. H1 title
-2. "When To Use"
-3. "Do Not Use When"
-4. "Procedure" or "Steps"
-5. Optional "Recovery And Edge Cases"
-6. Optional "Quality Checks"
+1. "Procedure" or "Steps"
+2. Optional "Recovery And Edge Cases"
+3. Optional "Quality Checks"
 
 # Scope Boundary
 
-"When To Use" must describe exactly one observable triggering scenario and what must be true before invoking the skill. Narrow the trigger when possible to avoid false-positive matches.
+`applicable_scenario` is the authoritative scope source. Treat it as a trigger-plus-exclusion capsule:
+- do not add a separate "When To Use" section
+- do not add a separate "Do Not Use When" section
+- do not broaden, soften, or replace the exclusions already implied there
+- use it to keep the procedure aligned and to write a consistent frontmatter description
 
-"Do Not Use When" must include at least two exclusions:
-- nearest-neighbor exclusion: a superficially similar task with a different objective or action space
-- constraint-mismatch exclusion: access, scope, or task constraints make this skill's approach unsuitable
+If the input outline or guidelines contain evidence from adjacent but different workflows, keep only the guidance that supports the chosen scope capsule and exclude the rest rather than broadening the skill.
 
-The frontmatter NOT clause should echo the nearest-neighbor exclusion. Scope rejection should appear before substantive action.
+The frontmatter NOT clause should stay aligned with the nearest-neighbor exclusion embedded in `applicable_scenario`.
 
 # Procedure Quality
 
-Within each step:
-- start with the step purpose
-- include 2-4 concise bullets or short paragraphs
-- weave success and failure guidance into the same explanation
-- include checks only when they clarify completion or constraint satisfaction
-- include recovery advice where failure patterns imply a branch
-- if constraints conflict, the constraint that limits action space takes priority
+Within each step, start with the step purpose, use 2-4 concise bullets or short paragraphs, and weave success, failure, checks, and recovery guidance together only when they clarify branching or completion. If constraints conflict, the constraint that limits action space takes priority.
 
 Avoid abstract philosophy, vague advice, trajectory summaries, mechanical bullet aggregation, source trajectory ids, implementation metadata, and raw input field names as repeated section labels.
 
