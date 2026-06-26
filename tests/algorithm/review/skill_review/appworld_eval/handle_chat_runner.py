@@ -159,6 +159,20 @@ def _export_skills_to_local_dir(create_user_id: str) -> str | None:
     return str(root)
 
 
+def _inspect_exported_skill_names(local_skill_dir: str | None, available_skills: list[str]) -> list[str]:
+    if not local_skill_dir:
+        return []
+    try:
+        from lazyllm.tools.agent.skill_manager import SkillManager
+
+        manager = SkillManager(dir=local_skill_dir, skills=available_skills)
+        manager._load_skills_index()
+        return sorted(str(name) for name in manager._skills_index)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning(f'[AppWorldEval] failed to inspect exported skills: {exc}')
+        return []
+
+
 def _build_flat_appworld_tool_group(tool: Any) -> Any:
     """Build a LazyLLM tool group whose callable names stay unprefixed."""
     from lazyllm.tools.agent.toolsManager import ToolGroup
@@ -175,6 +189,26 @@ def _build_flat_appworld_tool_group(tool: Any) -> Any:
         lazy=False,
         prefix=False,
     )
+
+
+def _disabled_tool_names(active_tool_name: str) -> list[str]:
+    from lazymind.chat.service import chat_service
+
+    return [
+        str(getattr(cfg, 'name', ''))
+        for cfg in chat_service.DEFAULT_TOOLS
+        if str(getattr(cfg, 'name', '')) != active_tool_name
+    ]
+
+
+def _adapt_handle_chat_kwargs(handle_chat: Any, kwargs: dict[str, Any], active_tool_name: str) -> dict[str, Any]:
+    signature = inspect.signature(handle_chat)
+    if 'disabled_tools' in signature.parameters:
+        kwargs = dict(kwargs)
+        kwargs['disabled_tools'] = _disabled_tool_names(active_tool_name)
+    if not any(param.kind == param.VAR_KEYWORD for param in signature.parameters.values()):
+        kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
+    return kwargs
 
 
 @contextmanager
@@ -250,9 +284,11 @@ async def run_appworld_eval_with_handle_chat(
     history_rows: list[dict[str, Any]] = []
     available_skills = _load_available_skill_names(create_user_id)
     local_skill_dir = _export_skills_to_local_dir(create_user_id) if available_skills else None
+    indexed_skills = _inspect_exported_skill_names(local_skill_dir, available_skills)
     print(
         f'[AppWorldEval] create_user_id={create_user_id!r} '
         f'loaded_skills={len(available_skills)} {available_skills} '
+        f'indexed_skills={len(indexed_skills)} {indexed_skills} '
         f'skill_fs_url={local_skill_dir or _cfg["skill_fs_url"]!r}',
         flush=True,
     )
@@ -477,9 +513,8 @@ async def _call_handle_chat(
     tool_config: dict[str, Any] | None,
     available_skills: list[str],
 ) -> Any:
-    from lazymind.chat.service import chat_service
+    from lazymind.chat.service.chat_service import handle_chat
 
-    signature = inspect.signature(chat_service.handle_chat)
     kwargs: dict[str, Any] = {
         'query': query,
         'history': [],
@@ -492,7 +527,6 @@ async def _call_handle_chat(
         'dataset': None,
         'priority': None,
         'available_tools': ['appworld_eval'],
-        'disabled_tools': _disabled_tools_except_appworld(chat_service.DEFAULT_TOOLS),
         'available_skills': available_skills,
         'memory': None,
         'user_preference': None,
@@ -503,22 +537,8 @@ async def _call_handle_chat(
         'model_config': model_config,
         'tool_config': tool_config,
     }
-    if not any(param.kind == param.VAR_KEYWORD for param in signature.parameters.values()):
-        kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key in signature.parameters
-        }
-    return await chat_service.handle_chat(**kwargs)
-
-
-def _disabled_tools_except_appworld(configs: list[Any]) -> list[str]:
-    disabled: list[str] = []
-    for cfg in configs:
-        name = str(getattr(cfg, 'name', '') or '')
-        if name and name != 'appworld_eval':
-            disabled.append(name)
-    return disabled
+    kwargs = _adapt_handle_chat_kwargs(handle_chat, kwargs, 'appworld_eval')
+    return await handle_chat(**kwargs)
 
 
 def _teardown_lazyllm_session(session_id: str) -> None:
