@@ -48,10 +48,12 @@ class Trajectory(BaseModel):
     qualified: bool = False
 
 
-class ClusterSignature(BaseModel):
-    intent: str
-    procedure: List[str] = Field(default_factory=list)
-    boundaries: str
+class ContextualDescription(BaseModel):
+    task_goal: str = ''
+    applicable_scenario: str = ''
+    execution_summary: str = ''
+    key_result: str = ''
+    environment: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RefinedTrajectory(BaseModel):
@@ -75,7 +77,7 @@ class GuidelineSet(BaseModel):
 
 class SkillDraft(BaseModel):
     session_id: str
-    cluster_signature: ClusterSignature
+    contextual_description: ContextualDescription
     refined_trajectory: RefinedTrajectory
     guidelines: GuidelineSet
     source_trajectory: str = ''
