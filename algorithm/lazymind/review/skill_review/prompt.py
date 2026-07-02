@@ -67,53 +67,54 @@ value_type candidates: success_pattern, failure_pattern, reasoning_pattern, retr
 
 def cluster_signature_prompt(trajectory: str) -> str:
     return f"""
-You are an expert Agent Memory Abstraction Engine, your task is to summarize the trajectory into a structured "contextual_description" for future task clustering and skill mining.
-
-Your task is to extract a compact "cluster_signature" for future task clustering and skill mining.
+You are an expert Agent Memory Abstraction Engine. Extract a compact "cluster_signature" for future task clustering and skill mining.
 
 # Objective
 
-Extract only the reusable task structure needed to decide whether multiple drafts should become one skill.
+Extract the reusable task structure needed to decide whether multiple drafts should become one skill.
 
 The output should describe:
 1. The reusable task intent
-2. The high-level reusable procedure
+2. The reusable procedure at a distinguishable middle level
 3. The applicability boundary for the skill
 
 # Requirements
 
-- Preserve reusable workflow structure, not case-specific details.
-- Keep wording general enough for reuse, but specific enough to separate this workflow from nearby ones.
+- Preserve the reusable task family, main target object, primary action space, and completion condition.
+- Keep wording general enough for reuse, but specific enough to separate nearby workflows.
 - Remove names, ids, dates, locations, prices, exact quantities, and incidental tool errors.
 - Do not mention exact tool names unless they define the reusable task.
+- Treat the cluster_signature as a compact clustering key, not a narrative summary.
 - output should be in the same language as the trajectory.
 
 For `intent`:
-- Describe exactly one primary task family, centered on one main objective and one main action space.
-- Prefer the stable reusable objective over the narrow observed case, but do not broaden across materially different workflows.
+- Describe exactly one primary task family, centered on one main objective, target object, action space, and completion condition.
+- Use compact discriminator wording such as "task family / target object / action / completion".
+- Prefer the stable reusable objective over the narrow observed case, but do not broaden across different target objects, action spaces, or completion conditions.
 - Do not mix read-only analysis, state-changing execution, and cross-domain side tasks into one intent.
 - Do not include fallback options, alternative resolutions, customer choice variants, or every observed root cause unless they change the core workflow.
-- Avoid vague phrases like "help the user", "handle the issue", or other generic outcome language.
+- Avoid generic workflow labels like "retrieve-filter-execute-verify" unless each part names the reusable object and action.
 
 For `procedure`:
-- Use 3-6 high-level reusable steps.
+- Use 3-6 reusable steps.
 - Keep only the core workflow needed to distinguish this skill family.
-- Merge adjacent diagnostics into broader steps when they belong to the same workflow.
+- Each step should retain the relevant object, action, or state change that makes the workflow distinct.
+- Merge adjacent diagnostics only when they belong to the same target object and action space.
 - Do not preserve detours, retries, or auxiliary work that does not define the reusable procedure.
 
 For `boundaries`:
 - Write one concise paragraph covering both when this workflow applies and when it should stay separate.
 - Keep nearby variants together only if the same core procedure and action space still solve them.
 - Separate cases that change the primary action space, target object space, or completion condition.
-- Do not exclude cases only because of incidental outcomes such as a tool success/failure, a specific root cause, or an optional recovery path.
+- Do not merge tasks only because they share a generic inspect/filter/execute/verify shell.
 
 # Output Format
 
 Return ONLY valid JSON:
 {{
-  "intent": "...",
+  "intent": "Task family: ...; target object: ...; action: ...; completion: ...",
   "procedure": ["...", "...", "..."],
-  "boundaries": "..."
+  "boundaries": "Applies when ...; keep separate from ..."
 }}
 
 # Trajectory
@@ -190,10 +191,12 @@ The pending skill is already structured, so extract only the three core parts ne
 
 # Requirements
 
-- Use the title and content to identify the reusable intent, procedure, and applicability boundary.
+- Use the title and content to identify the reusable intent, target object, action space, completion condition, procedure, and applicability boundary.
 - Split the skill content into meaningful operational steps for refined_trajectory.
 - Summarize the guidance embedded in each step into concise guidelines.
-- Keep the output abstract and reusable; do not copy Markdown headings mechanically.
+- Keep the output reusable but specific enough to separate nearby workflows; do not copy Markdown headings mechanically.
+- Do not reduce different tasks to a generic inspect/filter/execute/verify template.
+- Write cluster_signature as compact discriminator text, not a narrative summary.
 - Do not include implementation metadata, ids, review status, or database fields.
 - Output should be in the same language as the skill content.
 
@@ -202,9 +205,9 @@ The pending skill is already structured, so extract only the three core parts ne
 Return ONLY valid JSON:
 {{
   "cluster_signature": {{
-    "intent": "...",
+    "intent": "Task family: ...; target object: ...; action: ...; completion: ...",
     "procedure": ["...", "...", "..."],
-    "boundaries": "..."
+    "boundaries": "Applies when ...; keep separate from ..."
   }},
   "refined_trajectory": {{
     "steps": [
@@ -306,16 +309,14 @@ def cluster_prompt(drafts: list[dict[str, Any]]) -> str:
     return (
         'Cluster skill draft signatures into reusable skill families.\n'
         'Return JSON only: {"clusters":[{"task_scope":"...","draft_indexes":[0]}]}.\n\n'
-        'Merge drafts when they share the same reusable task intent, high-level procedure, and applicability scope.\n'
-        'Do not split drafts merely because one case has an extra root cause, a different outcome, a tool failure, '
-        'a different language/style, or a narrower boundary statement.\n'
-        'Do not split drafts merely because one includes an extra fallback option, alternative remediation path, '
-        'plan/customer choice variant, or broader/narrower wording.\n'
-        'Keep drafts separate only when an agent would need a materially different procedure or the combined skill '
-        'would become ambiguous.\n'
-        'A singleton cluster is allowed only when no existing cluster can handle that draft without changing the core procedure.\n'
-        'If a draft differs only by an extra fallback option, broader wording, or an alternative customer choice, '
-        'merge it into the closest broader cluster.\n'
+        'Merge drafts only when they share the same reusable intent, target object space, primary action space, '
+        'completion condition, and core procedure.\n'
+        'Keep drafts separate when merging would hide different target objects, read/write modes, side effects, '
+        'or success conditions, even if the steps look like inspect/filter/execute/verify.\n'
+        'Do not split drafts merely because one case has an incidental tool failure, extra root cause, '
+        'different language/style, or optional recovery path that does not change the core workflow.\n'
+        'Singleton clusters are allowed when no other draft matches the same reusable task family.\n'
+        'Write task_scope with the distinguishing boundary, not a broad generic workflow label.\n'
         'Every draft index must appear exactly once. Use the provided draft_index values.\n\n'
         f'DRAFT_SIGNATURES:\n{json.dumps(drafts, ensure_ascii=False, indent=2)}'
     )
@@ -385,9 +386,11 @@ Across the SOP, include at least once:
 # Scope Capsule
 
 `applicable_scenario` is the single scope field for downstream generation. Write it as one compact capsule that contains:
-- the reusable trigger
-- the prerequisite state or framing that must already hold
-- the nearest exclusions that distinguish this skill from adjacent workflows
+- applicable_scenario contains "When To Use" and "Do Not Use When" tow parts
+- "When To Use" must describe exactly one observable triggering scenario and what must be true before invoking the skill. Narrow the trigger when possible to avoid false-positive matches.
+- "Do Not Use When" must include at least two exclusions:
+  - nearest-neighbor exclusion: a superficially similar task with a different objective or action space
+  - constraint-mismatch exclusion: access, scope, or task constraints make this skill's approach unsuitable
 
 Keep it concise, but specific enough that downstream generation can treat `applicable_scenario` as the authoritative scope summary. Do not defer this scope writing to a later stage.
 
@@ -484,9 +487,10 @@ GOOD description:
 - "When you need to validate structured data against a known schema - provides systematic constraint checking (NOT for exploratory data browsing or ad-hoc queries)"
 
 Required Markdown sections in order:
-1. "Procedure" or "Steps"
-2. Optional "Recovery And Edge Cases"
-3. Optional "Quality Checks"
+1. H1 Tiele
+2. "Procedure" or "Steps"
+3. Optional "Recovery And Edge Cases"
+4. Optional "Quality Checks"
 
 # Scope Boundary
 
