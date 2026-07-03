@@ -3,6 +3,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+try:
+    from ..skill_usage import aggregate_skill_usage_counts, has_non_empty_trajectory
+except ImportError:  # pragma: no cover - direct script execution path
+    from skill_usage import aggregate_skill_usage_counts, has_non_empty_trajectory
+
 
 MAX_STEP_ERROR = 'max_steps_exceeded'
 TASK_TYPE_PATTERNS = {
@@ -68,13 +73,20 @@ def _build_task_success_rate(results: list[dict[str, Any]]) -> dict[str, dict[st
     }
 
 
-def compute_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+def compute_metrics(
+    results: list[dict[str, Any]],
+    skill_names: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> dict[str, Any]:
     total_tasks = len(results)
     success_results = [result for result in results if bool(result.get('success'))]
     success_count = len(success_results)
     error_count = sum(1 for result in results if result.get('error'))
     max_step_failures = sum(1 for result in results if result.get('error') == MAX_STEP_ERROR)
-    skill_usage_count = sum(1 for result in results if bool(result.get('used_skill')))
+    non_empty_results = [result for result in results if has_non_empty_trajectory(result)]
+    skill_usage_denominator = len(non_empty_results)
+    empty_trajectory_count = total_tasks - skill_usage_denominator
+    skill_usage_count = sum(1 for result in non_empty_results if bool(result.get('used_skill')))
+    skill_usage_by_name = aggregate_skill_usage_counts(results, skill_names)
 
     total_steps = sum(int(result.get('steps') or 0) for result in results)
     success_steps = sum(int(result.get('steps') or 0) for result in success_results)
@@ -85,8 +97,12 @@ def compute_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         'success_rate': success_count / total_tasks if total_tasks else 0.0,
         'avg_steps': total_steps / total_tasks if total_tasks else 0.0,
         'avg_success_steps': success_steps / success_count if success_count else 0.0,
+        'non_empty_trajectory_count': skill_usage_denominator,
+        'empty_trajectory_count': empty_trajectory_count,
         'skill_usage_count': skill_usage_count,
-        'skill_usage_rate': skill_usage_count / total_tasks if total_tasks else 0.0,
+        'skill_usage_denominator': skill_usage_denominator,
+        'skill_usage_rate': skill_usage_count / skill_usage_denominator if skill_usage_denominator else 0.0,
+        'skill_usage_by_name': skill_usage_by_name,
         'task_success_rate': _build_task_success_rate(results),
         'max_step_failure_rate': max_step_failures / total_tasks if total_tasks else 0.0,
         'error_count': error_count,

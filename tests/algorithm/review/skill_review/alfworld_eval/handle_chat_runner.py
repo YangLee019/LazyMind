@@ -18,9 +18,9 @@ from .history_db import ensure_conversation_row, insert_chat_history_row
 from .metrics import MAX_STEP_ERROR, compute_metrics, extract_gamefile, extract_won, infer_task_type_from_gamefile
 from .prompt import ALFWORLD_SYSTEM_PROMPT
 try:
-    from ..skill_usage import used_get_skill
+    from ..skill_usage import skill_usage_counts
 except ImportError:
-    from skill_usage import used_get_skill
+    from skill_usage import skill_usage_counts
 
 
 def _load_available_skill_names(create_user_id: str) -> list[str]:
@@ -286,7 +286,7 @@ async def run_alfworld_eval_with_handle_chat(
 
     summary = {
         'results': results,
-        'metrics': compute_metrics(results),
+        'metrics': compute_metrics(results, skill_names=available_skills),
         'chat_histories': history_rows,
     }
     return summary
@@ -368,7 +368,14 @@ async def _run_single_handle_chat_task(
         if error is None and not bool(getattr(tool, 'done', False)) and int(getattr(tool, 'step_count', 0) or 0) >= max_steps:
             error = MAX_STEP_ERROR
 
-        result = _task_result(task_id, tool, error, used_skill=used_get_skill(final_payloads))
+        usage_counts = skill_usage_counts(final_payloads, available_skills)
+        result = _task_result(
+            task_id,
+            tool,
+            error,
+            used_skill=any(usage_counts.values()),
+            skill_usage=usage_counts,
+        )
         return result, _build_chat_history_row(
             task_id=task_id,
             session_id=session_id,
@@ -383,7 +390,14 @@ async def _run_single_handle_chat_task(
         error = str(exc)
         if 'max_steps exceeded' in error:
             error = MAX_STEP_ERROR
-        result = _task_result(task_id, tool, error, used_skill=used_get_skill(final_payloads))
+        usage_counts = skill_usage_counts(final_payloads, available_skills)
+        result = _task_result(
+            task_id,
+            tool,
+            error,
+            used_skill=any(usage_counts.values()),
+            skill_usage=usage_counts,
+        )
         return result, _build_chat_history_row(
             task_id=task_id,
             session_id=session_id,
@@ -517,7 +531,14 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _task_result(task_id: int, tool: Any, error: str | None, *, used_skill: bool) -> dict[str, Any]:
+def _task_result(
+    task_id: int,
+    tool: Any,
+    error: str | None,
+    *,
+    used_skill: bool,
+    skill_usage: dict[str, int],
+) -> dict[str, Any]:
     final_reward = float(getattr(tool, 'reward', 0.0) or 0.0)
     won = extract_won(getattr(tool, 'info', {}))
     gamefile = extract_gamefile(getattr(tool, 'info', {})) or str(getattr(tool, 'gamefile', '') or '')
@@ -534,5 +555,6 @@ def _task_result(task_id: int, tool: Any, error: str | None, *, used_skill: bool
         'task_type': infer_task_type_from_gamefile(gamefile),
         'done': bool(getattr(tool, 'done', False)),
         'used_skill': used_skill,
+        'skill_usage': skill_usage,
         'error': error,
     }

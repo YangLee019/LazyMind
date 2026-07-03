@@ -4,9 +4,12 @@
 llm:
   - source: openai
     type: llm
+    # name: deepseek-v4-flash
+    # url: https://api.deepseek.com
+    # api_key: ${LAZYLLM_DEEPSEEK_API_KEY}
     name: minimax-m27
     url: http://106.75.235.251:9000/v1/
-    api_key: ${LAZYLLM_MINIMAX_API_KEY}
+    api_key: ${LAZYLLM_MINIMAX_API_KEY}    
 
 evo_llm:
   - source: openai

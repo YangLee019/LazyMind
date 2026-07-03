@@ -24,9 +24,9 @@ from .history_db import ensure_conversation_row, insert_chat_history_row
 from .metrics import MAX_STEP_ERROR, compute_metrics
 from .prompt import APPWORLD_SYSTEM_PROMPT
 try:
-    from ..skill_usage import used_get_skill
+    from ..skill_usage import skill_usage_counts
 except ImportError:
-    from skill_usage import used_get_skill
+    from skill_usage import skill_usage_counts
 
 
 def _load_available_skill_names(create_user_id: str) -> list[str]:
@@ -345,7 +345,7 @@ async def run_appworld_eval_with_handle_chat(
 
     return {
         'results': results,
-        'metrics': compute_metrics(results),
+        'metrics': compute_metrics(results, skill_names=available_skills),
         'chat_histories': history_rows,
     }
 
@@ -442,6 +442,7 @@ async def _run_single_handle_chat_task(
         if error is None and not completed and steps >= max_steps:
             error = MAX_STEP_ERROR
 
+        usage_counts = skill_usage_counts(final_payloads, available_skills)
         result = _task_result(
             episode_index=episode_index,
             task_id=task_id,
@@ -450,7 +451,8 @@ async def _run_single_handle_chat_task(
             runtime=runtime,
             error=error,
             service_tool_call_turns=service_tool_call_turns,
-            used_skill=used_get_skill(final_payloads),
+            used_skill=any(usage_counts.values()),
+            skill_usage=usage_counts,
         )
         return result, _build_chat_history_row(
             episode_index=episode_index,
@@ -470,6 +472,7 @@ async def _run_single_handle_chat_task(
         error = str(exc)
         if 'max_interactions' in error or 'max_steps' in error:
             error = MAX_STEP_ERROR
+        usage_counts = skill_usage_counts(final_payloads, available_skills)
         result = _task_result(
             episode_index=episode_index,
             task_id=task_id,
@@ -478,7 +481,8 @@ async def _run_single_handle_chat_task(
             runtime=runtime,
             error=error,
             service_tool_call_turns=None,
-            used_skill=used_get_skill(final_payloads),
+            used_skill=any(usage_counts.values()),
+            skill_usage=usage_counts,
         )
         return result, _build_chat_history_row(
             episode_index=episode_index,
@@ -578,6 +582,7 @@ def _build_unhandled_error_task(
         'tool_call_rounds': 0,
         'handle_chat_tool_call_turns': None,
         'used_skill': False,
+        'skill_usage': {},
         'completed': False,
         'evaluation': {},
         'task_status': {},
@@ -877,6 +882,7 @@ def _task_result(
     error: str | None,
     service_tool_call_turns: int | None,
     used_skill: bool,
+    skill_usage: dict[str, int],
 ) -> dict[str, Any]:
     evaluation = _extract_evaluation(evaluation_payload, runtime)
     steps = _extract_step_count(task_status, runtime)
@@ -898,6 +904,7 @@ def _task_result(
         'tool_call_rounds': steps,
         'handle_chat_tool_call_turns': service_tool_call_turns,
         'used_skill': used_skill,
+        'skill_usage': skill_usage,
         'completed': completed,
         'evaluation': evaluation,
         'task_status': {key: value for key, value in task_status.items() if key != 'trace'},

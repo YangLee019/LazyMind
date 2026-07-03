@@ -186,6 +186,12 @@ python tests/algorithm/review/skill_review/appworld_eval/run_eval.py \
 - `completed_rate`
 - `avg_steps`
 - `avg_success_steps`
+- `non_empty_trajectory_count`
+- `empty_trajectory_count`
+- `skill_usage_count`
+- `skill_usage_denominator`
+- `skill_usage_rate`
+- `skill_usage_by_name`
 - `max_step_failure_rate`
 - `error_count`
 - `total_tests`
