@@ -71,7 +71,7 @@ You are an expert Agent Memory Abstraction Engine. Extract a compact "cluster_si
 
 # Objective
 
-Extract the reusable task structure needed to decide whether multiple drafts should become one skill.
+Extract the reusable task structure that makes this trajectory comparable with other drafts during clustering.
 
 The output should describe:
 1. The reusable task intent
@@ -99,14 +99,14 @@ For `procedure`:
 - Use 3-6 reusable steps.
 - Keep only the core workflow needed to distinguish this skill family.
 - Each step should retain the relevant object, action, or state change that makes the workflow distinct.
-- Merge adjacent diagnostics only when they belong to the same target object and action space.
+- Combine adjacent diagnostics only when they belong to the same target object and action space.
 - Do not preserve detours, retries, or auxiliary work that does not define the reusable procedure.
 
 For `boundaries`:
 - Write one concise paragraph covering both when this workflow applies and when it should stay separate.
-- Keep nearby variants together only if the same core procedure and action space still solve them.
+- Include nearby variants only when the same core procedure and action space still solve them.
 - Separate cases that change the primary action space, target object space, or completion condition.
-- Do not merge tasks only because they share a generic inspect/filter/execute/verify shell.
+- Do not define the boundary around a generic inspect/filter/execute/verify shell; anchor it on object, action, and completion.
 
 # Output Format
 
@@ -143,7 +143,7 @@ A retained step should:
 - represent a reusable reasoning or execution pattern
 - be higher-level than one message or tool call
 - focus on intent, strategy, state transition, or critical decision
-- merge multiple low-level actions when they serve the same purpose
+- combine multiple low-level actions when they serve the same purpose
 
 Keep a step ONLY IF it preserved a task-critical constraint, changed understanding, changed execution strategy, produced critical evidence, corrected an important mistake, directly contributed to success/failure, or introduced a reusable reasoning/action pattern.
 
@@ -195,7 +195,7 @@ The pending skill is already structured, so extract only the three core parts ne
 - Split the skill content into meaningful operational steps for refined_trajectory.
 - Summarize the guidance embedded in each step into concise guidelines.
 - Keep the output reusable but specific enough to separate nearby workflows; do not copy Markdown headings mechanically.
-- Do not reduce different tasks to a generic inspect/filter/execute/verify template.
+- Do not define cluster_signature around a generic inspect/filter/execute/verify template; anchor it on object, action, and completion.
 - Write cluster_signature as compact discriminator text, not a narrative summary.
 - Do not include implementation metadata, ids, review status, or database fields.
 - Output should be in the same language as the skill content.
@@ -298,7 +298,8 @@ def draft_prompt(trajectory: dict[str, Any]) -> str:
     return (
         'You extract a reusable skill draft from one agent trajectory.\n'
         'Return JSON only with keys: cluster_signature, refined_trajectory, guidelines.\n'
-        'cluster_signature has intent, procedure, boundaries.\n'
+        'cluster_signature has intent, procedure, boundaries. '
+        'Write it as compact clustering text anchored on task family, target object, action, and completion.\n'
         'refined_trajectory has steps: step_index, role, action, state, tool_name, skill_name.\n'
         'guidelines has success_patterns and failure_patterns, each item has related_step and guideline.\n\n'
         f'TRAJECTORY:\n{json.dumps(trajectory, ensure_ascii=False, indent=2)}'
@@ -386,9 +387,8 @@ Across the SOP, include at least once:
 # Scope Capsule
 
 `applicable_scenario` is the single scope field for downstream generation. Write it as one compact capsule that contains:
-- applicable_scenario contains "When To Use" and "Do Not Use When" tow parts
-- "When To Use" must describe exactly one observable triggering scenario and what must be true before invoking the skill. Narrow the trigger when possible to avoid false-positive matches.
-- "Do Not Use When" must include at least two exclusions:
+- a use trigger: exactly one observable triggering scenario and what must be true before invoking the skill. Narrow the trigger when possible to avoid false-positive matches.
+- exclusion boundaries, including at least two cases:
   - nearest-neighbor exclusion: a superficially similar task with a different objective or action space
   - constraint-mismatch exclusion: access, scope, or task constraints make this skill's approach unsuitable
 
@@ -451,7 +451,7 @@ Your job is to synthesize them into a human-authored `SKILL.md` document. The `c
 - Enrich each SOP step with deduplicated, integrated operational guidance.
 - Reuse the outline's scope boundary as authoritative instead of inventing a new one.
 - Improve reliability, recovery, decision quality, and self-checking.
-- Do not merge different action spaces into one skill, especially read-only workflows with state-changing workflows.
+- Do not include guidance from different action spaces in one skill, especially read-only workflows with state-changing workflows.
 - Ignore source-specific detours, one-off troubleshooting branches, and incidental trajectory noise unless they are required for the reusable workflow boundary.
 
 # Guideline Integration
@@ -487,7 +487,7 @@ GOOD description:
 - "When you need to validate structured data against a known schema - provides systematic constraint checking (NOT for exploratory data browsing or ad-hoc queries)"
 
 Required Markdown sections in order:
-1. H1 Tiele
+1. H1 Title
 2. "Procedure" or "Steps"
 3. Optional "Recovery And Edge Cases"
 4. Optional "Quality Checks"
