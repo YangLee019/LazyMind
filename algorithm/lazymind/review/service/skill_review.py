@@ -69,7 +69,7 @@ class _UserSkillReviewState:
 
 def run_skill_review(request: SkillReviewRequest) -> SkillReviewBatchResult:
     with lazyllm.new_session(request.requestid):
-        inject_model_config(request.model_configs)
+        inject_model_config(_model_options_from_request(request))
         llm = AutoModel(model='llm')
         emb = AutoModel(model='embed_main')
         return _run_skill_review(request, llm, emb)
@@ -224,6 +224,7 @@ def _run_user_skill_review(
             state.drafts,
             emb,
             artifact_dir=base_work_dir,
+            **_cluster_options_from_request(request),
         )
         state.stage_reports.append(cluster_report)
         LOG.info(f'[SkillReview] user {user_id} found {len(state.clusters)} clusters')
@@ -511,6 +512,29 @@ def _build_user_result(
         },
         candidates=resolutions if qualified else [],
     )
+
+
+def _cluster_options_from_request(request: SkillReviewRequest) -> dict[str, Any]:
+    config = request.model_configs.get('cluster') if isinstance(request.model_configs, dict) else None
+    if not isinstance(config, dict):
+        return {}
+    options: dict[str, Any] = {}
+    strategy = str(config.get('embedding_strategy') or config.get('strategy') or '').strip()
+    if strategy:
+        options['embedding_strategy'] = strategy
+    if 'llm_cluster_threshold' in config:
+        options['llm_cluster_threshold'] = int(config.get('llm_cluster_threshold') or 0)
+    return options
+
+
+def _model_options_from_request(request: SkillReviewRequest) -> dict[str, Any]:
+    if not isinstance(request.model_configs, dict):
+        return {}
+    return {
+        key: value
+        for key, value in request.model_configs.items()
+        if key != 'cluster'
+    }
 
 
 def _resolve_artifact_dir(artifact_dir: str | Path | None, *, requestid: str) -> Path:

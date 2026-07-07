@@ -24,6 +24,35 @@ from lazymind.review.skill_review.reports import finish_stage_report, stage_erro
 MIN_VALID_EMBEDDING_RATIO = 0.8
 DEFAULT_LLM_CLUSTER_THRESHOLD = 20
 UMAP_RANDOM_STATE = 42
+CLUSTER_STRATEGY_TEXT_CONCAT = 'text_concat'
+CLUSTER_STRATEGY_WEIGHTED_AVERAGE = 'weighted_average'
+CLUSTER_STRATEGY_WEIGHTED_CONCAT = 'weighted_concat'
+CLUSTER_STRATEGY_REDUCED_WEIGHTED_CONCAT = 'reduced_weighted_concat'
+CLUSTER_STRATEGY_WEIGHTED_COSINE = 'weighted_cosine'
+DEFAULT_CLUSTER_EMBEDDING_STRATEGY = CLUSTER_STRATEGY_WEIGHTED_CONCAT
+CLUSTER_EMBEDDING_STRATEGIES = {
+    CLUSTER_STRATEGY_TEXT_CONCAT,
+    CLUSTER_STRATEGY_WEIGHTED_AVERAGE,
+    CLUSTER_STRATEGY_WEIGHTED_CONCAT,
+    CLUSTER_STRATEGY_REDUCED_WEIGHTED_CONCAT,
+    CLUSTER_STRATEGY_WEIGHTED_COSINE,
+}
+CLUSTER_EMBEDDING_STRATEGY_ALIASES = {
+    'original': CLUSTER_STRATEGY_TEXT_CONCAT,
+    'concat_text': CLUSTER_STRATEGY_TEXT_CONCAT,
+    'weighted_mean': CLUSTER_STRATEGY_WEIGHTED_AVERAGE,
+    'weighted_vector_average': CLUSTER_STRATEGY_WEIGHTED_AVERAGE,
+    'pre_umap_concat': CLUSTER_STRATEGY_WEIGHTED_CONCAT,
+    'weighted_section_concat': CLUSTER_STRATEGY_WEIGHTED_CONCAT,
+    'post_umap_concat': CLUSTER_STRATEGY_REDUCED_WEIGHTED_CONCAT,
+    'reduced_concat': CLUSTER_STRATEGY_REDUCED_WEIGHTED_CONCAT,
+    'weighted_similarity': CLUSTER_STRATEGY_WEIGHTED_COSINE,
+}
+CLUSTER_EMBEDDING_WEIGHTS = {
+    'intent': 0.55,
+    'procedure': 0.30,
+    'boundaries': 0.15,
+}
 
 _CLUSTER_SCHEMA = {
     'title': 'skill_draft_cluster_response',
@@ -57,10 +86,12 @@ def cluster_drafts(
     max_workers: int = DEFAULT_STAGE_WORKERS,
     embedding_max_chars: int = DEFAULT_EMBEDDING_MAX_CHARS,
     embedding_retries: int = DEFAULT_EMBEDDING_RETRIES,
+    embedding_strategy: str = DEFAULT_CLUSTER_EMBEDDING_STRATEGY,
     artifact_dir: Path | None = None,
 ) -> tuple[list[TaskCluster], dict]:
     started_at = start_stage()
     input_count = len(drafts)
+    embedding_strategy = _normalize_embedding_strategy(embedding_strategy)
     if not drafts:
         clusters: list[TaskCluster] = []
         if artifact_dir is not None:
@@ -76,6 +107,7 @@ def cluster_drafts(
                 draft_count=0,
                 valid_embedding_count=0,
                 failed_embedding_count=0,
+                embedding_strategy=embedding_strategy,
             ),
         )
     drafts = [draft for draft in drafts if _cluster_text(draft)]
@@ -94,6 +126,7 @@ def cluster_drafts(
                 draft_count=input_count,
                 valid_embedding_count=0,
                 failed_embedding_count=input_count,
+                embedding_strategy=embedding_strategy,
             ),
         )
     if len(drafts) == 1:
@@ -110,6 +143,7 @@ def cluster_drafts(
                 draft_count=input_count,
                 valid_embedding_count=len(drafts),
                 failed_embedding_count=input_count - len(drafts),
+                embedding_strategy=embedding_strategy,
             ),
         )
 
@@ -138,24 +172,28 @@ def cluster_drafts(
                 failed_embedding_count=input_count - len(drafts),
                 method='llm',
                 llm_cluster_threshold=llm_cluster_threshold,
+                embedding_strategy=embedding_strategy,
             ),
         )
 
-    texts = [_cluster_text(draft) for draft in drafts]
     raw_embeddings, embedded_drafts, errors = _embed_drafts(
         drafts,
-        texts,
         emb,
         max_workers=max_workers,
         max_chars=embedding_max_chars,
         retries=embedding_retries,
+        strategy=embedding_strategy,
     )
-    embeddings, valid_drafts, dimension_errors = _validate_embeddings(raw_embeddings, embedded_drafts)
+    if _strategy_uses_section_embeddings(embedding_strategy):
+        embeddings, valid_drafts, dimension_errors = _validate_section_embeddings(raw_embeddings, embedded_drafts)
+    else:
+        embeddings, valid_drafts, dimension_errors = _validate_embeddings(raw_embeddings, embedded_drafts)
     errors.extend(dimension_errors)
     metadata = _cluster_report_metadata(
         draft_count=input_count,
         valid_embedding_count=len(valid_drafts),
         failed_embedding_count=input_count - len(valid_drafts),
+        embedding_strategy=embedding_strategy,
     )
     if metadata['valid_embedding_ratio'] < MIN_VALID_EMBEDDING_RATIO:
         exc = RuntimeError(
@@ -205,7 +243,7 @@ def cluster_drafts(
         )
 
     try:
-        labels, cluster_metadata = _embedding_cluster_labels(np.array(embeddings))
+        labels, cluster_metadata = _cluster_labels_by_strategy(embeddings, embedding_strategy)
         metadata.update(cluster_metadata)
         clusters = _clusters_from_labels(valid_drafts, labels)
     except Exception as exc:
@@ -227,19 +265,19 @@ def cluster_drafts(
 
 def _embed_drafts(
     drafts: list[SkillDraft],
-    texts: list[str],
     emb,
     *,
     max_workers: int,
     max_chars: int,
     retries: int,
+    strategy: str,
 ) -> tuple[list, list[SkillDraft], list[dict]]:
     results = [None] * len(drafts)
     errors: list[dict] = []
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         futures = {
-            executor.submit(_embed_text_with_retry, emb, text[:max_chars], retries): (index, draft)
-            for index, (draft, text) in enumerate(zip(drafts, texts))
+            executor.submit(_embed_draft_with_retry, emb, draft, max_chars, retries, strategy): (index, draft)
+            for index, draft in enumerate(drafts)
         }
         for fut in as_completed(futures):
             index, draft = futures[fut]
@@ -259,6 +297,47 @@ def _embed_drafts(
     return valid_embeddings, valid_drafts, errors
 
 
+def _embed_draft_with_retry(emb, draft: SkillDraft, max_chars: int, retries: int, strategy: str):
+    if strategy == CLUSTER_STRATEGY_TEXT_CONCAT:
+        return _embed_text_with_retry(emb, _plain_cluster_text(draft)[:max_chars], retries)
+
+    section_vectors = _embed_draft_sections_with_retry(emb, draft, max_chars, retries)
+    if strategy == CLUSTER_STRATEGY_WEIGHTED_AVERAGE:
+        return _average_weighted_sections(section_vectors).tolist()
+    if strategy == CLUSTER_STRATEGY_WEIGHTED_CONCAT:
+        return _concat_weighted_sections(section_vectors).tolist()
+    if _strategy_uses_section_embeddings(strategy):
+        return {name: vector.tolist() for name, vector in section_vectors.items()}
+    raise ValueError(f'unsupported cluster embedding strategy: {strategy}')
+
+
+def _embed_draft_sections_with_retry(
+    emb,
+    draft: SkillDraft,
+    max_chars: int,
+    retries: int,
+) -> dict[str, np.ndarray]:
+    section_vectors = {}
+    expected_dim: int | None = None
+    for name, text in _cluster_embedding_sections(draft).items():
+        if not text:
+            continue
+        embedding = _embed_text_with_retry(emb, text[:max_chars], retries)
+        vector = _normalized_embedding_vector(embedding)
+        if expected_dim is None:
+            expected_dim = int(vector.size)
+        elif vector.size != expected_dim:
+            raise ValueError(
+                f'section embedding dimension mismatch in {name}: '
+                f'expected {expected_dim}, got {vector.size}'
+            )
+        section_vectors[name] = vector
+
+    if not section_vectors or expected_dim is None:
+        raise ValueError('cluster signature has no embeddable sections')
+    return section_vectors
+
+
 def _embed_text_with_retry(emb, text: str, retries: int):
     attempts = max(1, retries)
     last_exc: Exception | None = None
@@ -273,6 +352,60 @@ def _embed_text_with_retry(emb, text: str, retries: int):
             if attempt + 1 < attempts:
                 time.sleep(min(2 ** attempt, 4))
     raise RuntimeError(f'embedding failed after {attempts} attempts: {last_exc}') from last_exc
+
+
+def _normalized_embedding_vector(embedding) -> np.ndarray:
+    vector = np.squeeze(np.asarray(embedding, dtype=float))
+    if vector.ndim != 1:
+        raise ValueError(f'embedding vector must be one-dimensional, got shape {vector.shape}')
+    if vector.size == 0:
+        raise ValueError('embedding vector is empty')
+    if not np.all(np.isfinite(vector)):
+        raise ValueError('embedding vector contains non-finite values')
+    return _l2_normalize(vector)
+
+
+def _l2_normalize(vector: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm <= 0:
+        raise ValueError('embedding vector has zero norm')
+    return vector / norm
+
+
+def _average_weighted_sections(section_vectors: dict[str, np.ndarray]) -> np.ndarray:
+    weighted_vectors = []
+    used_weight_sum = 0.0
+    for name, weight in CLUSTER_EMBEDDING_WEIGHTS.items():
+        vector = section_vectors.get(name)
+        if vector is None or weight <= 0:
+            continue
+        weighted_vectors.append(vector * float(weight))
+        used_weight_sum += float(weight)
+    if not weighted_vectors or used_weight_sum <= 0:
+        raise ValueError('cluster embedding has no positive section weights')
+    combined = np.sum(weighted_vectors, axis=0) / used_weight_sum
+    return _l2_normalize(combined)
+
+
+def _concat_weighted_sections(section_vectors: dict[str, np.ndarray]) -> np.ndarray:
+    dimension = _section_embedding_dimension(section_vectors)
+    parts = []
+    for name, weight in CLUSTER_EMBEDDING_WEIGHTS.items():
+        if weight <= 0:
+            continue
+        vector = section_vectors.get(name)
+        if vector is None:
+            vector = np.zeros(dimension, dtype=float)
+        parts.append(vector * float(np.sqrt(weight)))
+    if not parts:
+        raise ValueError('cluster embedding has no positive section weights')
+    return _l2_normalize(np.concatenate(parts))
+
+
+def _section_embedding_dimension(section_vectors: dict[str, np.ndarray]) -> int:
+    for vector in section_vectors.values():
+        return int(vector.size)
+    raise ValueError('cluster signature has no embeddable sections')
 
 
 def _validate_embeddings(
@@ -306,6 +439,42 @@ def _validate_embeddings(
     return valid_embeddings, valid_drafts, errors
 
 
+def _validate_section_embeddings(
+    embeddings: list,
+    drafts: list[SkillDraft],
+) -> tuple[list[dict[str, np.ndarray]], list[SkillDraft], list[dict]]:
+    valid_embeddings: list[dict[str, np.ndarray]] = []
+    valid_drafts: list[SkillDraft] = []
+    errors: list[dict] = []
+    expected_dims: dict[str, int] = {}
+    for draft, section_embedding in zip(drafts, embeddings):
+        try:
+            if not isinstance(section_embedding, dict) or not section_embedding:
+                raise ValueError('section embedding must be a non-empty object')
+            normalized_sections: dict[str, np.ndarray] = {}
+            for name, embedding in section_embedding.items():
+                if name not in CLUSTER_EMBEDDING_WEIGHTS:
+                    continue
+                vector = _normalized_embedding_vector(embedding)
+                expected_dim = expected_dims.get(name)
+                if expected_dim is None:
+                    expected_dims[name] = int(vector.size)
+                elif vector.size != expected_dim:
+                    raise ValueError(
+                        f'section embedding dimension mismatch for {name}: '
+                        f'expected {expected_dim}, got {vector.size}'
+                    )
+                normalized_sections[name] = vector
+            if not normalized_sections:
+                raise ValueError('section embedding contains no known sections')
+        except Exception as exc:
+            errors.append(stage_error('cluster.embedding_dimension', draft.session_id, exc))
+            continue
+        valid_embeddings.append(normalized_sections)
+        valid_drafts.append(draft)
+    return valid_embeddings, valid_drafts, errors
+
+
 def _cluster_report_metadata(
     *,
     draft_count: int,
@@ -313,9 +482,10 @@ def _cluster_report_metadata(
     failed_embedding_count: int,
     method: str = 'embedding',
     llm_cluster_threshold: int = DEFAULT_LLM_CLUSTER_THRESHOLD,
+    embedding_strategy: str = DEFAULT_CLUSTER_EMBEDDING_STRATEGY,
 ) -> dict:
     valid_embedding_ratio = valid_embedding_count / draft_count if draft_count else 1.0
-    return {
+    metadata = {
         'draft_count': draft_count,
         'valid_embedding_count': valid_embedding_count,
         'failed_embedding_count': failed_embedding_count,
@@ -324,6 +494,34 @@ def _cluster_report_metadata(
         'method': method,
         'llm_cluster_threshold': llm_cluster_threshold,
     }
+    if method == 'embedding':
+        metadata['embedding_strategy'] = embedding_strategy
+        metadata['embedding_weights'] = dict(CLUSTER_EMBEDDING_WEIGHTS)
+    return metadata
+
+
+def _normalize_embedding_strategy(strategy: str | None) -> str:
+    normalized = str(strategy or DEFAULT_CLUSTER_EMBEDDING_STRATEGY).strip().lower().replace('-', '_')
+    normalized = CLUSTER_EMBEDDING_STRATEGY_ALIASES.get(normalized, normalized)
+    if normalized not in CLUSTER_EMBEDDING_STRATEGIES:
+        allowed = ', '.join(sorted(CLUSTER_EMBEDDING_STRATEGIES))
+        raise ValueError(f'unsupported cluster embedding strategy {strategy!r}; allowed: {allowed}')
+    return normalized
+
+
+def _strategy_uses_section_embeddings(strategy: str) -> bool:
+    return strategy in {
+        CLUSTER_STRATEGY_REDUCED_WEIGHTED_CONCAT,
+        CLUSTER_STRATEGY_WEIGHTED_COSINE,
+    }
+
+
+def _cluster_labels_by_strategy(embeddings, strategy: str) -> tuple[list[int], dict]:
+    if strategy == CLUSTER_STRATEGY_REDUCED_WEIGHTED_CONCAT:
+        return _reduced_weighted_concat_cluster_labels(embeddings)
+    if strategy == CLUSTER_STRATEGY_WEIGHTED_COSINE:
+        return _weighted_cosine_cluster_labels(embeddings)
+    return _embedding_cluster_labels(np.array(embeddings))
 
 
 def _llm_clusters(drafts: list[SkillDraft], llm) -> list[TaskCluster]:
@@ -378,13 +576,146 @@ def _cluster_prompt_items(drafts: list[SkillDraft]) -> list[dict[str, Any]]:
 
 
 def _cluster_text(draft: SkillDraft) -> str:
-    signature = draft.cluster_signature
     parts = [
-        signature.intent.strip(),
-        '\n'.join(step.strip() for step in signature.procedure if step.strip()),
-        signature.boundaries.strip(),
+        f'{name.upper()}: {text}'
+        for name, text in _cluster_embedding_sections(draft).items()
+        if text
     ]
-    return '\n'.join(part for part in parts if part)
+    return '\n'.join(parts)
+
+
+def _cluster_embedding_sections(draft: SkillDraft) -> dict[str, str]:
+    signature = draft.cluster_signature
+    return {
+        'intent': signature.intent.strip(),
+        'procedure': '\n'.join(step.strip() for step in signature.procedure if step.strip()),
+        'boundaries': signature.boundaries.strip(),
+    }
+
+
+def _plain_cluster_text(draft: SkillDraft) -> str:
+    return '\n'.join(text for text in _cluster_embedding_sections(draft).values() if text)
+
+
+def _reduced_weighted_concat_cluster_labels(
+    section_embeddings: list[dict[str, np.ndarray]],
+) -> tuple[list[int], dict]:
+    reduced_embeddings, reduction_metadata = _reduce_and_concat_sections(section_embeddings)
+    hdbscan_labels, hdbscan_metadata = _hdbscan_labels(reduced_embeddings)
+    hdbscan_stats = _label_stats(hdbscan_labels)
+    hdbscan_stats.update(hdbscan_metadata)
+    return hdbscan_labels, {
+        'embedding_clusterer': 'section_umap_hdbscan',
+        'embedding_cluster_stats': hdbscan_stats,
+        'embedding_reduction': reduction_metadata,
+    }
+
+
+def _weighted_cosine_cluster_labels(
+    section_embeddings: list[dict[str, np.ndarray]],
+) -> tuple[list[int], dict]:
+    distance_matrix, distance_metadata = _weighted_cosine_distance_matrix(section_embeddings)
+    hdbscan_labels, hdbscan_metadata = _hdbscan_labels(distance_matrix, metric='precomputed')
+    hdbscan_stats = _label_stats(hdbscan_labels)
+    hdbscan_stats.update(hdbscan_metadata)
+    return hdbscan_labels, {
+        'embedding_clusterer': 'weighted_cosine_hdbscan',
+        'embedding_cluster_stats': hdbscan_stats,
+        'embedding_distance': distance_metadata,
+    }
+
+
+def _reduce_and_concat_sections(
+    section_embeddings: list[dict[str, np.ndarray]],
+) -> tuple[np.ndarray, dict]:
+    sample_count = len(section_embeddings)
+    blocks_by_section: dict[str, np.ndarray] = {}
+    section_metadata: dict[str, dict[str, Any]] = {}
+    for name, weight in CLUSTER_EMBEDDING_WEIGHTS.items():
+        if weight <= 0:
+            continue
+        indexed_vectors = [
+            (index, sections[name])
+            for index, sections in enumerate(section_embeddings)
+            if name in sections
+        ]
+        if not indexed_vectors:
+            section_metadata[name] = {'method': 'skipped_empty_section'}
+            continue
+
+        indexes = [index for index, _ in indexed_vectors]
+        vectors = np.array([vector for _, vector in indexed_vectors], dtype=float)
+        if len(vectors) >= 3:
+            reduced, metadata = _umap_reduce_embeddings(vectors)
+            reduced = np.asarray([_l2_normalize(vector) for vector in reduced], dtype=float)
+        else:
+            reduced = vectors
+            metadata = {
+                'method': 'identity_small_section',
+                'input_dimension': int(vectors.shape[1]),
+                'output_dimension': int(vectors.shape[1]),
+                'sample_count': int(len(vectors)),
+            }
+
+        block = np.zeros((sample_count, int(reduced.shape[1])), dtype=float)
+        scale = float(np.sqrt(weight))
+        for source_index, vector in zip(indexes, reduced):
+            block[source_index] = vector * scale
+        blocks_by_section[name] = block
+        metadata['weight'] = float(weight)
+        section_metadata[name] = metadata
+
+    if not blocks_by_section:
+        raise ValueError('no section embeddings available for reduced weighted concatenation')
+    concatenated = np.concatenate([blocks_by_section[name] for name in blocks_by_section], axis=1)
+    normalized = np.asarray([_l2_normalize(vector) for vector in concatenated], dtype=float)
+    return normalized, {
+        'method': 'section_umap_then_weighted_concat',
+        'sections': section_metadata,
+        'output_dimension': int(normalized.shape[1]),
+    }
+
+
+def _weighted_cosine_distance_matrix(
+    section_embeddings: list[dict[str, np.ndarray]],
+) -> tuple[np.ndarray, dict]:
+    sample_count = len(section_embeddings)
+    distances = np.zeros((sample_count, sample_count), dtype=float)
+    for left_index in range(sample_count):
+        for right_index in range(left_index + 1, sample_count):
+            similarity, used_weight_sum = _weighted_section_similarity(
+                section_embeddings[left_index],
+                section_embeddings[right_index],
+            )
+            if used_weight_sum <= 0:
+                distance = 1.0
+            else:
+                distance = 1.0 - max(-1.0, min(1.0, similarity))
+            distances[left_index, right_index] = distance
+            distances[right_index, left_index] = distance
+    return distances, {
+        'method': 'weighted_section_cosine',
+        'metric': 'precomputed',
+        'weights': dict(CLUSTER_EMBEDDING_WEIGHTS),
+    }
+
+
+def _weighted_section_similarity(
+    left: dict[str, np.ndarray],
+    right: dict[str, np.ndarray],
+) -> tuple[float, float]:
+    score = 0.0
+    used_weight_sum = 0.0
+    for name, weight in CLUSTER_EMBEDDING_WEIGHTS.items():
+        left_vector = left.get(name)
+        right_vector = right.get(name)
+        if left_vector is None or right_vector is None or weight <= 0:
+            continue
+        score += float(weight) * float(np.dot(left_vector, right_vector))
+        used_weight_sum += float(weight)
+    if used_weight_sum <= 0:
+        return 0.0, 0.0
+    return score / used_weight_sum, used_weight_sum
 
 
 def _embedding_cluster_labels(embeddings: np.ndarray) -> tuple[list[int], dict]:
@@ -407,7 +738,7 @@ def _umap_reduce_embeddings(embeddings: np.ndarray) -> tuple[np.ndarray, dict]:
 
     sample_count = len(embeddings)
     n_neighbors = min(sample_count - 1, min(20, max(10, int(round(sample_count ** 0.5 * 1.5)))))
-    n_components = min(10, sample_count - 1)
+    n_components = min(15, sample_count - 1)
     reducer = UMAP(
         n_neighbors=n_neighbors,
         n_components=n_components,
@@ -427,7 +758,7 @@ def _umap_reduce_embeddings(embeddings: np.ndarray) -> tuple[np.ndarray, dict]:
     }
 
 
-def _hdbscan_labels(embeddings: np.ndarray) -> tuple[list[int], dict]:
+def _hdbscan_labels(embeddings: np.ndarray, metric: str = 'euclidean') -> tuple[list[int], dict]:
     min_cluster_size = max(2, min(10, int(round(len(embeddings) ** 0.5)) - 1))
     min_samples = 1
     try:
@@ -436,7 +767,7 @@ def _hdbscan_labels(embeddings: np.ndarray) -> tuple[list[int], dict]:
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=min_cluster_size,
             min_samples=min_samples,
-            metric='euclidean',
+            metric=metric,
         )
     except ImportError:
         from sklearn.cluster import HDBSCAN
@@ -444,13 +775,13 @@ def _hdbscan_labels(embeddings: np.ndarray) -> tuple[list[int], dict]:
         clusterer = HDBSCAN(
             min_cluster_size=min_cluster_size,
             min_samples=min_samples,
-            metric='euclidean',
+            metric=metric,
         )
     labels = clusterer.fit_predict(embeddings)
     return [int(label) for label in labels], {
         'min_cluster_size': int(min_cluster_size),
         'min_samples': int(min_samples),
-        'metric': 'euclidean',
+        'metric': metric,
     }
 
 
