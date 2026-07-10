@@ -39,6 +39,9 @@ def call_json(
                 prompt,
                 response_format={'type': 'json_object'},
                 timeout=DEFAULT_LLM_CALL_TIMEOUT_SECONDS,
+                stream=False,
+                temperature=0.2,
+                top_p=0.7,
             )
             last_raw = raw
             _record_token_usage(prompt, raw)

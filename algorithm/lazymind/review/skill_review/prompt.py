@@ -70,7 +70,7 @@ You are an expert Agent Memory Abstraction Engine. Extract a compact "cluster_si
 
 # Objective
 
-Extract the reusable task structure needed to decide whether multiple drafts should become one skill.
+Extract the reusable task structure that makes this trajectory comparable with other drafts during clustering.
 
 The output should describe:
 1. The reusable task intent
@@ -83,12 +83,13 @@ The output should describe:
 - Keep wording general enough for reuse, but specific enough to separate nearby workflows.
 - Remove names, ids, dates, locations, prices, exact quantities, and incidental tool errors.
 - Do not mention exact tool names unless they define the reusable task.
-- Treat the cluster_signature as a compact clustering key, not a narrative summary.
-- output should be in the same language as the trajectory.
-
+ - Treat the cluster_signature as a compact clustering key, not a narrative summary.
+ - output should be in the same language as the trajectory.
 For `intent`:
 - Describe exactly one primary task family, centered on one main objective, target object, action space, and completion condition.
 - Use compact discriminator wording such as "task family / target object / action / completion".
+- Use ONE line with the exact field order: Task family; target object; action; completion. Do not omit any field.
+- Make the action discriminate read/write mode and side effects (e.g. approve vs deny vs refund; create vs delete).
 - Prefer the stable reusable objective over the narrow observed case, but do not broaden across different target objects, action spaces, or completion conditions.
 - Do not mix read-only analysis, state-changing execution, and cross-domain side tasks into one intent.
 - Do not include fallback options, alternative resolutions, customer choice variants, or every observed root cause unless they change the core workflow.
@@ -99,22 +100,25 @@ For `procedure`:
 - Use 3-6 reusable steps.
 - Keep only the core workflow needed to distinguish this skill family.
 - Each step should retain the relevant object, action, or state change that makes the workflow distinct.
-- Merge adjacent diagnostics only when they belong to the same target object and action space.
+- Prefer "verb + object + scope condition" phrasing in each step (avoid generic shells without the discriminative object/action).
+- Combine adjacent diagnostics only when they belong to the same target object and action space.
 - Do not preserve detours, retries, or auxiliary work that does not define the reusable procedure.
 
 For `boundaries`:
-- Write one concise paragraph covering the positive applicability signal and the nearest boundary signals for future clustering.
-- Mention nearby variants that the same core procedure and action space can still cover.
-- Mark changes to the primary action space, target object space, or completion condition as boundary signals for a different skill family.
-- Do not describe the boundary with only a generic inspect/filter/execute/verify shell; name the reusable object and action space that make this workflow distinct.
+- Write one concise paragraph covering both when this workflow applies and when it should stay separate.
+- Use ONE line with the structure: "Applies when ...; keep separate from ...".
+- In "keep separate from", explicitly list the nearest adjacent task families that differ in target object space, action space, or completion condition, especially when side effects differ.
+- Include nearby variants only when the same core procedure and action space still solve them.
+- Separate cases that change the primary action space, target object space, or completion condition.
+- Do not define the boundary around a generic inspect/filter/execute/verify shell; anchor it on object, action, and completion.
 
 # Output Format
 
 Return ONLY valid JSON:
 {{
-  "intent": "...",
+  "intent": "Task family: ...; target object: ...; action: ...; completion: ...",
   "procedure": ["...", "...", "..."],
-  "boundaries": "..."
+  "boundaries": "Applies when ...; keep separate from ..."
 }}
 
 # Trajectory
@@ -143,7 +147,7 @@ A retained step should:
 - represent a reusable reasoning or execution pattern
 - be higher-level than one message or tool call
 - focus on intent, strategy, state transition, or critical decision
-- merge multiple low-level actions when they serve the same purpose
+- combine multiple low-level actions when they serve the same purpose
 
 Keep a step ONLY IF it preserved a task-critical constraint, changed understanding, changed execution strategy, produced critical evidence, corrected an important mistake, directly contributed to success/failure, or introduced a reusable reasoning/action pattern.
 
@@ -191,10 +195,12 @@ The pending skill is already structured, so extract only the three core parts ne
 
 # Requirements
 
-- Use the title and content to identify the reusable intent, procedure, and applicability boundary.
+- Use the title and content to identify the reusable intent, target object, action space, completion condition, procedure, and applicability boundary.
 - Split the skill content into meaningful operational steps for refined_trajectory.
 - Summarize the guidance embedded in each step into concise guidelines.
-- Keep the output abstract and reusable; do not copy Markdown headings mechanically.
+- Keep the output reusable but specific enough to separate nearby workflows; do not copy Markdown headings mechanically.
+- Do not define cluster_signature around a generic inspect/filter/execute/verify template; anchor it on object, action, and completion.
+- Write cluster_signature as compact discriminator text, not a narrative summary.
 - Do not include implementation metadata, ids, review status, or database fields.
 - Output should be in the same language as the skill content.
 
@@ -203,9 +209,9 @@ The pending skill is already structured, so extract only the three core parts ne
 Return ONLY valid JSON:
 {{
   "cluster_signature": {{
-    "intent": "...",
+    "intent": "Task family: ...; target object: ...; action: ...; completion: ...",
     "procedure": ["...", "...", "..."],
-    "boundaries": "..."
+    "boundaries": "Applies when ...; keep separate from ..."
   }},
   "refined_trajectory": {{
     "steps": [
@@ -296,7 +302,8 @@ def draft_prompt(trajectory: dict[str, Any]) -> str:
     return (
         'You extract a reusable skill draft from one agent trajectory.\n'
         'Return JSON only with keys: cluster_signature, refined_trajectory, guidelines.\n'
-        'cluster_signature has intent, procedure, boundaries.\n'
+        'cluster_signature has intent, procedure, boundaries. '
+        'Write it as compact clustering text anchored on task family, target object, action, and completion.\n'
         'refined_trajectory has steps: step_index, role, action, state, tool_name, skill_name.\n'
         'guidelines has success_patterns and failure_patterns, each item has related_step and guideline.\n\n'
         f'TRAJECTORY:\n{json.dumps(trajectory, ensure_ascii=False, indent=2)}'
@@ -307,16 +314,14 @@ def cluster_prompt(drafts: list[dict[str, Any]]) -> str:
     return (
         'Cluster skill draft signatures into reusable skill families.\n'
         'Return JSON only: {"clusters":[{"task_scope":"...","draft_indexes":[0]}]}.\n\n'
-        'Merge drafts when they share the same reusable task intent, high-level procedure, and applicability scope.\n'
-        'Do not split drafts merely because one case has an extra root cause, a different outcome, a tool failure, '
-        'a different language/style, or a narrower boundary statement.\n'
-        'Do not split drafts merely because one includes an extra fallback option, alternative remediation path, '
-        'plan/customer choice variant, or broader/narrower wording.\n'
-        'Keep drafts separate only when an agent would need a materially different procedure or the combined skill '
-        'would become ambiguous.\n'
-        'A singleton cluster is allowed only when no existing cluster can handle that draft without changing the core procedure.\n'
-        'If a draft differs only by an extra fallback option, broader wording, or an alternative customer choice, '
-        'merge it into the closest broader cluster.\n'
+        'Merge drafts only when they share the same reusable intent, target object space, primary action space, '
+        'completion condition, and core procedure.\n'
+        'Keep drafts separate when merging would hide different target objects, read/write modes, side effects, '
+        'or success conditions, even if the steps look like inspect/filter/execute/verify.\n'
+        'Do not split drafts merely because one case has an incidental tool failure, extra root cause, '
+        'different language/style, or optional recovery path that does not change the core workflow.\n'
+        'Singleton clusters are allowed when no other draft matches the same reusable task family.\n'
+        'Write task_scope with the distinguishing boundary, not a broad generic workflow label.\n'
         'Every draft index must appear exactly once. Use the provided draft_index values.\n\n'
         f'DRAFT_SIGNATURES:\n{json.dumps(drafts, ensure_ascii=False, indent=2)}'
     )
@@ -432,6 +437,19 @@ def candidate_prompt(outline: dict[str, Any], guidelines: dict[str, Any]) -> str
 Your task is to transform a **Skill Outline** into a complete reusable `SKILL.md`.
 The Skill Outline already defines the workflow. Your job is **not** to redesign or expand the workflow, but to enrich each procedure step with reusable operational knowledge distilled from the provided success and failure guidelines.
 The output should read like a human-authored operational playbook rather than a collection of extracted observations.
+
+# SKILL.md Format Requirements (MUST)
+
+You must generate a complete `SKILL.md` document in the `content` field, hard format requirements as follows:
+- `content` MUST start with YAML frontmatter at the very beginning of the file (the first characters are `---`).
+- The YAML frontmatter MUST include non-empty keys: `name`, `description`, `category`.
+- The YAML frontmatter `name` MUST EXACTLY equal the provided outline `skill_name`. Do not rename it.
+- `content` MUST include a closing `---` line for the frontmatter.
+- After the frontmatter closing `---`, `content` MUST include non-empty Markdown body content (not just frontmatter).
+- Do not wrap the SKILL.md in a markdown code fence; output raw SKILL.md text in `content`.
+- `description` MUST be a single concise routing sentence and MUST be <= 1024 characters.
+- `name` MUST be concise English lowercase kebab-case.
+- `category` MUST be a single lowercase ASCII token (no slashes).
 
 # Inputs
 You receive:
@@ -593,6 +611,9 @@ def resolution_prompt(candidate: dict[str, Any], called_skills: dict[str, str]) 
         '- patch_skill_name: required when type="patch"; the called skill name to patch\n'
         '- summary: for patch, describe the intent of this modification; for new, use null\n'
         '- patched_skill: when type="patch", the full patched SKILL.md content; when type="new", use an empty string\n\n'
+        'If type="patch", patched_skill MUST be a complete valid SKILL.md with YAML frontmatter at the very beginning '
+        'including non-empty keys: name, description, category, and it MUST include non-empty markdown body content after '
+        'the frontmatter.\n\n'
         f'CALLED_SKILLS:\n{json.dumps(called_skills, ensure_ascii=False, indent=2)}\n\n'
         f'CANDIDATE_SKILL:\n{json.dumps(candidate, ensure_ascii=False, indent=2)}'
     )

@@ -25,6 +25,12 @@ MIN_VALID_EMBEDDING_RATIO = 0.8
 DEFAULT_LLM_CLUSTER_THRESHOLD = 20
 UMAP_RANDOM_STATE = 42
 
+CLUSTER_EMBEDDING_WEIGHTS = {
+    'intent': 0.55,
+    'procedure': 0.25,
+    'boundaries': 0.20,
+}
+
 _CLUSTER_SCHEMA = {
     'title': 'skill_draft_cluster_response',
     'type': 'object',
@@ -141,10 +147,8 @@ def cluster_drafts(
             ),
         )
 
-    texts = [_cluster_text(draft) for draft in drafts]
     raw_embeddings, embedded_drafts, errors = _embed_drafts(
         drafts,
-        texts,
         emb,
         max_workers=max_workers,
         max_chars=embedding_max_chars,
@@ -227,7 +231,6 @@ def cluster_drafts(
 
 def _embed_drafts(
     drafts: list[SkillDraft],
-    texts: list[str],
     emb,
     *,
     max_workers: int,
@@ -238,8 +241,8 @@ def _embed_drafts(
     errors: list[dict] = []
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         futures = {
-            executor.submit(_embed_text_with_retry, emb, text[:max_chars], retries): (index, draft)
-            for index, (draft, text) in enumerate(zip(drafts, texts))
+            executor.submit(_embed_draft_weighted_concat, emb, draft, max_chars, retries): (index, draft)
+            for index, draft in enumerate(drafts)
         }
         for fut in as_completed(futures):
             index, draft = futures[fut]
@@ -273,6 +276,77 @@ def _embed_text_with_retry(emb, text: str, retries: int):
             if attempt + 1 < attempts:
                 time.sleep(min(2 ** attempt, 4))
     raise RuntimeError(f'embedding failed after {attempts} attempts: {last_exc}') from last_exc
+
+
+def _embed_draft_weighted_concat(emb, draft: SkillDraft, max_chars: int, retries: int):
+    section_vectors = _embed_draft_sections_with_retry(emb, draft, max_chars, retries)
+    return _concat_weighted_sections(section_vectors).tolist()
+
+
+def _embed_draft_sections_with_retry(
+    emb,
+    draft: SkillDraft,
+    max_chars: int,
+    retries: int,
+) -> dict[str, np.ndarray]:
+    section_vectors = {}
+    expected_dim: int | None = None
+    for name, text in _cluster_embedding_sections(draft).items():
+        if not text:
+            continue
+        embedding = _embed_text_with_retry(emb, text[:max_chars], retries)
+        vector = _normalized_embedding_vector(embedding)
+        if expected_dim is None:
+            expected_dim = int(vector.size)
+        elif vector.size != expected_dim:
+            raise ValueError(
+                f'section embedding dimension mismatch in {name}: '
+                f'expected {expected_dim}, got {vector.size}'
+            )
+        section_vectors[name] = vector
+
+    if not section_vectors or expected_dim is None:
+        raise ValueError('cluster signature has no embeddable sections')
+    return section_vectors
+
+
+def _normalized_embedding_vector(embedding) -> np.ndarray:
+    vector = np.squeeze(np.asarray(embedding, dtype=float))
+    if vector.ndim != 1:
+        raise ValueError(f'embedding vector must be one-dimensional, got shape {vector.shape}')
+    if vector.size == 0:
+        raise ValueError('embedding vector is empty')
+    if not np.all(np.isfinite(vector)):
+        raise ValueError('embedding vector contains non-finite values')
+    return _l2_normalize(vector)
+
+
+def _l2_normalize(vector: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm <= 0:
+        raise ValueError('embedding vector has zero norm')
+    return vector / norm
+
+
+def _concat_weighted_sections(section_vectors: dict[str, np.ndarray]) -> np.ndarray:
+    dimension = _section_embedding_dimension(section_vectors)
+    parts = []
+    for name, weight in CLUSTER_EMBEDDING_WEIGHTS.items():
+        if weight <= 0:
+            continue
+        vector = section_vectors.get(name)
+        if vector is None:
+            vector = np.zeros(dimension, dtype=float)
+        parts.append(vector * float(np.sqrt(weight)))
+    if not parts:
+        raise ValueError('cluster embedding has no positive section weights')
+    return _l2_normalize(np.concatenate(parts))
+
+
+def _section_embedding_dimension(section_vectors: dict[str, np.ndarray]) -> int:
+    for vector in section_vectors.values():
+        return int(vector.size)
+    raise ValueError('cluster signature has no embeddable sections')
 
 
 def _validate_embeddings(
@@ -386,6 +460,15 @@ def _cluster_text(draft: SkillDraft) -> str:
         signature.boundaries.strip(),
     ]
     return '\n'.join(part for part in parts if part)
+
+
+def _cluster_embedding_sections(draft: SkillDraft) -> dict[str, str]:
+    signature = draft.cluster_signature
+    return {
+        'intent': str(signature.intent or '').strip(),
+        'procedure': '\n'.join(step.strip() for step in signature.procedure if str(step or '').strip()).strip(),
+        'boundaries': str(signature.boundaries or '').strip(),
+    }
 
 
 def _embedding_cluster_labels(embeddings: np.ndarray) -> tuple[list[int], dict]:
